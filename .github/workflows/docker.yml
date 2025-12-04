@@ -12,6 +12,10 @@ env:
 jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 授予写权限，用于创建 Release
+      packages: write # 授予写权限，用于推送 Docker 镜像
+      
     # run only when code is compiling and tests are passing
     if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
     # steps to perform in job
