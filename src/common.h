@@ -1,14 +1,16 @@
 #ifndef __COMMON_H
 #define __COMMON_H
 
-#include <stdint.h>
+// ❌ 删除这一行，它导致了和 vmlinux.h 的冲突
+// #include <stdint.h>
 
-// 这是我们将从内核发送到用户空间的日志事件结构体
+// 这是一个非常基础的结构体，我们直接用原始类型即可
+// 在 64 位系统上，unsigned int 就是 32 位，unsigned short 就是 16 位
 struct log_event {
-    uint32_t src_ip;    // 源 IP 地址
-    uint32_t dst_ip;    // 目标 IP 地址
-    uint16_t src_port;  // 源端口
-    uint16_t dst_port;  // 目标端口
+    unsigned int src_ip;    // 对应 uint32_t / __be32
+    unsigned int dst_ip;
+    unsigned short src_port; // 对应 uint16_t / __be16
+    unsigned short dst_port;
 };
 
 #endif /* __COMMON_H */
