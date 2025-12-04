@@ -3,6 +3,7 @@ name: Build and public docker image
 on:
   push:
     branches: "master"
+
 env:
   REGISTRY: registry.cn-hangzhou.aliyuncs.com
   IMAGE_NAMESPACE: testwydimage
@@ -13,11 +14,12 @@ jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 授予写权限，用于创建 Release
-      packages: write # 授予写权限，用于推送 Docker 镜像
+      contents: read # 读取代码即可，不需要 write
+      packages: write 
 
     # run only when code is compiling and tests are passing
     if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
+
     # steps to perform in job
     steps:
       - name: Checkout code
@@ -25,15 +27,9 @@ jobs:
         with:
           submodules: 'recursive'
 
-      - name: install deps
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-          libelf1 libelf-dev zlib1g-dev libclang-dev \
-          make git clang llvm pkg-config build-essential
-
-      - name: build package
-        run:  make build
-
+      # --- 关键修改：删除了 install deps 和 build package 步骤 ---
+      # 所有的编译现在都在下面的 Build image 步骤中，通过 Dockerfile 自动完成
+      
       # setup Docker buld action
       - name: Set up Docker Buildx
         id: buildx
@@ -45,18 +41,20 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.USERNAME_ALI }}
           password: ${{ secrets.PASSWORD_ALI }}
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: type=ref,event=branch,prefix=
-      - name: Build image and push to GitHub Container Registry
+
+      - name: Build image and push to Aliyun
         uses: docker/build-push-action@v2
         with:
           # relative path to the place where source code with Dockerfile is located
           context: ./
-          file: dockerfile
+          file: Dockerfile
           platforms: linux/amd64
           # Note: tags has to be all lower-case
           tags: |
