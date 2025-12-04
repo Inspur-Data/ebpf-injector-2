@@ -5,7 +5,7 @@ FROM debian:bullseye-slim AS builder
 # Set an environment variable to avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install all build dependencies
+# Install all build dependencies, including the multi-arch support library
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
@@ -16,14 +16,14 @@ RUN apt-get update && \
     libelf1 \
     libelf-dev \
     zlib1g-dev \
-    git
+    git \
+    g++-multilib # <--- 关键：添加这个包来解决 stubs-32.h 缺失的问题
 
 # Copy the entire source code into the builder stage
 WORKDIR /src
 COPY . .
 
 # Build the application. The executable will be created inside this stage.
-# The default Makefile will place the binary at /src/src/bootstrap
 RUN make build
 
 
@@ -32,9 +32,7 @@ RUN make build
 FROM debian:bullseye-slim
 
 # Copy the compiled binary from the 'builder' stage to the final image.
-# We place it in a standard location for system binaries.
 COPY --from=builder /src/src/bootstrap /usr/sbin/bootstrap
 
 # This is the command that will run when the container starts.
-# Note: The actual command and arguments will be provided by the Kubernetes YAML.
 CMD ["/usr/sbin/bootstrap"]
