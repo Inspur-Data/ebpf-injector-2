@@ -1,173 +1,120 @@
-// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
-/* Copyright (c) 2020 Facebook */
-#include <argp.h>
-#include <signal.h>
+// SPDX-License-Identifier: GPL-2.0
 #include <stdio.h>
-#include <time.h>
-#include <sys/resource.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
 #include <bpf/libbpf.h>
-#include "bootstrap.h"
-#include "bootstrap.skel.h"
-
-static struct env {
-	bool verbose;
-	long min_duration_ms;
-} env;
-
-const char *argp_program_version = "bootstrap 0.0";
-const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
-const char argp_program_doc[] =
-"BPF bootstrap demo application.\n"
-"\n"
-"It traces process start and exits and shows associated \n"
-"information (filename, process duration, PID and PPID, etc).\n"
-"\n"
-"USAGE: ./bootstrap [-d <min-duration-ms>] [-v]\n";
-
-static const struct argp_option opts[] = {
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ "duration", 'd', "DURATION-MS", 0, "Minimum process duration (ms) to report" },
-	{},
-};
-
-static error_t parse_arg(int key, char *arg, struct argp_state *state)
-{
-	switch (key) {
-	case 'v':
-		env.verbose = true;
-		break;
-	case 'd':
-		errno = 0;
-		env.min_duration_ms = strtol(arg, NULL, 10);
-		if (errno || env.min_duration_ms <= 0) {
-			fprintf(stderr, "Invalid duration: %s\n", arg);
-			argp_usage(state);
-		}
-		break;
-	case ARGP_KEY_ARG:
-		argp_usage(state);
-		break;
-	default:
-		return ARGP_ERR_UNKNOWN;
-	}
-	return 0;
-}
-
-static const struct argp argp = {
-	.options = opts,
-	.parser = parse_arg,
-	.doc = argp_program_doc,
-};
-
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
-{
-	if (level == LIBBPF_DEBUG && !env.verbose)
-		return 0;
-	return vfprintf(stderr, format, args);
-}
+#include <net/if.h>
+#include <errno.h>
+#include "injector.skel.h" // ！！！ 关键改动：引入自动生成的骨架头文件
 
 static volatile bool exiting = false;
 
-static void sig_handler(int sig)
-{
-	exiting = true;
+static void sig_handler(int sig) {
+    exiting = true;
 }
 
-static int handle_event(void *ctx, void *data, size_t data_sz)
-{
-	const struct event *e = data;
-	struct tm *tm;
-	char ts[32];
-	time_t t;
+// 函数保持不变，但传入的 map 参数类型变为 struct bpf_map *
+void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
+    if (!map) {
+        fprintf(stderr, "BPF map is NULL\n");
+        return;
+    }
 
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+    char *ports_copy = strdup(ports_str); // strtok会修改原字符串，创建一个副本
+    if (!ports_copy) {
+        perror("strdup");
+        return;
+    }
 
-	if (e->exit_event) {
-		printf("%-8s %-5s %-16s %-7d %-7d [%u]",
-		       ts, "EXIT", e->comm, e->pid, e->ppid, e->exit_code);
-		if (e->duration_ns)
-			printf(" (%llums)", e->duration_ns / 1000000);
-		printf("\n");
-	} else {
-		printf("%-8s %-5s %-16s %-7d %-7d %s\n",
-		       ts, "EXEC", e->comm, e->pid, e->ppid, e->filename);
-	}
-
-	return 0;
+    char *port_token = strtok(ports_copy, ",");
+    while (port_token != NULL) {
+        char *range_sep = strchr(port_token, '-');
+        if (range_sep) {
+            *range_sep = '\0';
+            int start_port = atoi(port_token);
+            int end_port = atoi(range_sep + 1);
+            if (start_port > 0 && end_port > 0 && end_port >= start_port) {
+                printf("Enabling Proxy Protocol for port range %d-%d\n", start_port, end_port);
+                for (int port = start_port; port <= end_port; port++) {
+                    __u16 p = (__u16)port;
+                    __u8 v = 1;
+                    // ！！！ 关键改动：使用 libbpf 提供的 map 更新函数
+                    bpf_map__update_elem(map, &p, sizeof(p), &v, sizeof(v), BPF_ANY);
+                }
+            } else {
+                fprintf(stderr, "Invalid port range: %s-%s\n", port_token, range_sep + 1);
+            }
+        } else {
+            int port = atoi(port_token);
+            if (port > 0 && port < 65536) {
+                __u16 p = (__u16)port;
+                __u8 v = 1;
+                // ！！！ 关键改动：使用 libbpf 提供的 map 更新函数
+                bpf_map__update_elem(map, &p, sizeof(p), &v, sizeof(v), BPF_ANY);
+                printf("Enabled Proxy Protocol for port %d\n", port);
+            } else {
+                fprintf(stderr, "Invalid port: %s\n", port_token);
+            }
+        }
+        port_token = strtok(NULL, ",");
+    }
+    free(ports_copy); // 释放副本
 }
 
-int main(int argc, char **argv)
-{
-	struct ring_buffer *rb = NULL;
-	struct bootstrap_bpf *skel;
-	int err;
+int main(int argc, char **argv) {
+    struct injector_bpf *skel; // ！！！ 关键改动：定义骨架结构体
+    int ifindex, err;
+    char *iface;
+    char *ports_str;
 
-	/* Parse command line arguments */
-	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
-	if (err)
-		return err;
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <interface> <port_list>\n", argv[0]);
+        fprintf(stderr, "Example: %s eth0 2000-3000,39075\n", argv[0]);
+        return 1;
+    }
 
-	/* Set up libbpf errors and debug info callback */
-	libbpf_set_print(libbpf_print_fn);
+    iface = argv[1];
+    ports_str = argv[2];
 
-	/* Cleaner handling of Ctrl-C */
-	signal(SIGINT, sig_handler);
-	signal(SIGTERM, sig_handler);
+    ifindex = if_nametoindex(iface);
+    if (!ifindex) {
+        perror("if_nametoindex");
+        return 1;
+    }
 
-	/* Load and verify BPF application */
-	skel = bootstrap_bpf__open();
-	if (!skel) {
-		fprintf(stderr, "Failed to open and load BPF skeleton\n");
-		return 1;
-	}
+    // ！！！ 关键改动：打开、加载并验证 eBPF 程序
+    skel = injector_bpf__open_and_load();
+    if (!skel) {
+        fprintf(stderr, "ERROR: Failed to open and load BPF skeleton\n");
+        return 1;
+    }
 
-	/* Parameterize BPF code with minimum duration parameter */
-	skel->rodata->min_duration_ns = env.min_duration_ms * 1000000ULL;
+    // ！！！ 关键改动：直接通过骨架访问 map
+    parse_and_update_ports(skel->maps.ports_map, ports_str);
 
-	/* Load & verify BPF programs */
-	err = bootstrap_bpf__load(skel);
-	if (err) {
-		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
-		goto cleanup;
-	}
+    // ！！！ 关键改动：设置 TC Hook 的 ifindex 并自动附加
+    skel->links.tc_proxy_protocol = bpf_program__attach_tc(skel->progs.tc_proxy_protocol, ifindex, BPF_TC_INGRESS);
+    if (!skel->links.tc_proxy_protocol) {
+        err = -errno;
+        fprintf(stderr, "ERROR: Failed to attach TC program: %s\n", strerror(-err));
+        goto cleanup;
+    }
 
-	/* Attach tracepoints */
-	err = bootstrap_bpf__attach(skel);
-	if (err) {
-		fprintf(stderr, "Failed to attach BPF skeleton\n");
-		goto cleanup;
-	}
+    printf("Successfully attached eBPF program to %s. Press Ctrl+C to exit.\n", iface);
 
-	/* Set up ring buffer polling */
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
-	if (!rb) {
-		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
-		goto cleanup;
-	}
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 
-	/* Process events */
-	printf("%-8s %-5s %-16s %-7s %-7s %s\n",
-	       "TIME", "EVENT", "COMM", "PID", "PPID", "FILENAME/EXIT CODE");
-	while (!exiting) {
-		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
-		/* Ctrl-C will cause -EINTR */
-		if (err == -EINTR) {
-			err = 0;
-			break;
-		}
-		if (err < 0) {
-			printf("Error polling perf buffer: %d\n", err);
-			break;
-		}
-	}
+    while (!exiting) {
+        sleep(1);
+    }
 
 cleanup:
-	/* Clean up */
-	ring_buffer__free(rb);
-	bootstrap_bpf__destroy(skel);
-
-	return err < 0 ? -err : 0;
+    // ！！！ 关键改动：销毁骨架，它会自动处理所有清理工作
+    injector_bpf__destroy(skel);
+    printf("\nDetached eBPF program and cleaned up.\n");
+    return 0;
 }
+
