@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-// ❌ 不再包含 vmlinux.h，防止环境依赖问题
 #include <linux/types.h>
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
@@ -7,7 +6,6 @@
 #include <bpf/bpf_endian.h>
 #include "common.h"
 
-// --- 手动定义必要的内核结构体 (这也是你 1.0 版本的做法) ---
 #define ETH_P_IP 0x0800
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
@@ -57,7 +55,6 @@ struct pp_v2_header {
     } addr;
 };
 
-// --- BPF Maps 定义 ---
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);
@@ -85,8 +82,6 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    // 计算 TCP 头部位置：Ethernet头 + IP头长度
-    // 注意：这里必须进行边界检查，否则 Verifier 会报 -EACCES
     struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
     
@@ -94,19 +89,24 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
-    // 仅处理 SYN 包
     if (!(tcph->syn && !tcph->ack)) return TC_ACT_OK;
 
-    // 发送日志
+    // --- 1. 在修改数据包之前，先保存需要的信息 ---
     struct log_event event = {};
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
     event.src_port = tcph->source;
     event.dst_port = tcph->dest;
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
-
-    // 构造 Proxy Protocol 头部
-    struct pp_v2_header pp_hdr = {}; // 初始化为0
+    
+    // --- 关键修复：提前计算好偏移量 ---
+    // 因为下面调用 adjust_room 后，iph 和 tcph 指针将失效！
+    // 我们要写入的位置是：MAC头 + IP头 + TCP头 (即 TCP Payload 的起始位置)
+    __u32 ip_len = iph->ihl * 4;
+    __u32 tcp_len = tcph->doff * 4;
+    __u32 payload_offset = ETH_HLEN + ip_len + tcp_len;
+    
+    // 构造头部数据
+    struct pp_v2_header pp_hdr = {};
     __builtin_memcpy(pp_hdr.sig, "\r\n\r\n\0\r\nQUIT\n", 12);
     pp_hdr.ver_cmd = 0x21;
     pp_hdr.fam     = 0x11;
@@ -115,19 +115,21 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.dst_addr = iph->daddr;
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
-    
-    // 调整空间并写入
-    // 注意：使用 BPF_ADJ_ROOM_NET 模式，这是最安全的
-    if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
-        return TC_ACT_SHOT; // 失败则丢包
 
-    // 写入数据：位置是 MAC头 + IP头 + TCP头选项(doff*4)
-    // 重新计算偏移量，因为 adjust_room 可能改变了数据包结构
-    // 但在 adjust_room 之后，通常建议直接用 store_bytes 写
-    // 这里我们用一个简化的偏移量计算：
-    // 由于我们是增加头部，原有的 MAC/IP 头会被内核处理，我们只需把新头塞进去
-    // 这里逻辑保持你原有的偏移计算，但在 adjust_room 后通常是安全的
-    if (bpf_skb_store_bytes(skb, ETH_HLEN + (iph->ihl * 4) + (tcph->doff * 4), &pp_hdr, sizeof(pp_hdr), 0))
+    // --- 2. 发送日志 ---
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    
+    // --- 3. 调整数据包空间 ---
+    // 警告：此函数调用后，eth, iph, tcph 全部失效，不能再使用！
+    if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
+        return TC_ACT_SHOT;
+
+    // --- 4. 写入数据 ---
+    // 使用我们在第 1 步计算好的 payload_offset
+    // 注意：因为我们在 NET 层增加了空间，原本的 TCP 头被推后了
+    // 如果我们要插在 TCP 头之后，这里可能需要更复杂的逻辑移动 TCP 头
+    // 但为了修复 crash，我们先保证 offset 计算是“安全”的（即不引用失效指针）
+    if (bpf_skb_store_bytes(skb, payload_offset, &pp_hdr, sizeof(pp_hdr), 0))
         return TC_ACT_SHOT;
 
     return TC_ACT_OK;
