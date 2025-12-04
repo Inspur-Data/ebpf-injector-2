@@ -10,7 +10,7 @@
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
 
-// --- 简化的结构体定义 (避免位域) ---
+// 简化的结构体定义
 struct ethhdr {
     unsigned char h_dest[6];
     unsigned char h_source[6];
@@ -18,7 +18,7 @@ struct ethhdr {
 };
 
 struct iphdr {
-    __u8 ver_ihl; // 手动处理 version 和 ihl
+    __u8 ver_ihl;
     __u8 tos;
     __be16 tot_len;
     __be16 id;
@@ -35,7 +35,7 @@ struct tcphdr {
     __be16 dest;
     __be32 seq;
     __be32 ack_seq;
-    __u8 res1_doff; // 手动处理 doff
+    __u8 res1_doff;
     __u8 flags;
     __be16 window;
     __u16 check;
@@ -70,43 +70,31 @@ struct {
     __uint(value_size, sizeof(int));
 } log_events SEC(".maps");
 
-
 SEC("tc")
 int tc_proxy_protocol(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
 
-    // 1. 解析 Ethernet
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
 
-    // 2. 解析 IP
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    // 手动提取 IHL (Header Length)
-    // iph->ver_ihl 的低4位是 IHL
     __u32 ihl = iph->ver_ihl & 0x0F;
-    if (ihl < 5) return TC_ACT_OK; // 最小长度
+    if (ihl < 5) return TC_ACT_OK;
 
-    // 3. 解析 TCP
-    // 计算 TCP 头位置: eth + ip_len
     struct tcphdr *tcph = (void *)iph + (ihl * 4);
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
     
-    // 检查端口映射
     __u16 target_port = bpf_ntohs(tcph->dest);
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
-    // 检查 SYN 包 (Flags 在第13字节后)
-    // 0x02 是 SYN, 0x10 是 ACK. 我们要 SYN=1, ACK=0
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
-    // --- 准备数据 ---
-    // 提取 TCP Data Offset
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
     if (doff < 5) return TC_ACT_OK;
 
@@ -117,12 +105,20 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     event.dst_port = tcph->dest;
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
-    // 计算插入位置: MAC + IP + TCP
-    // 使用固定值计算，避免验证器认为变量不可控
     __u32 payload_offset = ETH_HLEN + (ihl * 4) + (doff * 4);
 
     struct pp_v2_header pp_hdr = {};
-    __builtin_memcpy(pp_hdr.sig, "\r\n\r\n\0\r\nQUIT\n", 12);
+    
+    // ⚠️⚠️⚠️ 关键修改 ⚠️⚠️⚠️
+    // 不再使用字符串常量 "\r\n\r\n\0\r\nQUIT\n"
+    // 而是手动逐字节赋值，防止编译器生成 .rodata 段
+    pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
+    pp_hdr.sig[2] = 0x0D; pp_hdr.sig[3] = 0x0A;
+    pp_hdr.sig[4] = 0x00; pp_hdr.sig[5] = 0x0D;
+    pp_hdr.sig[6] = 0x0A; pp_hdr.sig[7] = 0x51; // Q
+    pp_hdr.sig[8] = 0x55; pp_hdr.sig[9] = 0x49; // U, I
+    pp_hdr.sig[10] = 0x54; pp_hdr.sig[11] = 0x0A; // T, \n
+
     pp_hdr.ver_cmd = 0x21;
     pp_hdr.fam     = 0x11;
     pp_hdr.len     = bpf_htons(12);
@@ -131,18 +127,14 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
-    // --- 修改数据包 ---
-    // 1. 腾出空间
     if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // 2. 写入数据 (使用计算好的安全偏移量)
     if (bpf_skb_store_bytes(skb, payload_offset, &pp_hdr, sizeof(pp_hdr), 0))
         return TC_ACT_SHOT;
 
     return TC_ACT_OK;
 }
 
-// ❌ 移除这行: char _license[] SEC("license") = "GPL";
-// ✅ 改用这种方式强制定义 License 段，不生成 .rodata map
-SEC("license") const char __license[] = "GPL";
+// License 字符串是特殊的，libbpf 会单独处理，不会生成 map，所以这里是安全的
+char _license[] SEC("license") = "GPL";
