@@ -6,7 +6,7 @@ on:
 
 env:
   REGISTRY: registry.cn-hangzhou.aliyuncs.com
-  IMAGE_NAMESPACE: ebpf-injector-2
+  IMAGE_NAMESPACE: testwydimage
   IMAGE_NAME: ebpf-injector-2
 
 jobs:
