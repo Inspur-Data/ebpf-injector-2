@@ -1,7 +1,6 @@
 #ifndef __COMMON_H
 #define __COMMON_H
 
-// 定义日志数据结构
 struct log_event {
     unsigned int src_ip;
     unsigned int dst_ip;

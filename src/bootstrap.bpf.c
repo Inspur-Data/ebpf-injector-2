@@ -10,6 +10,7 @@
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
 
+// --- 简化的结构体定义 (避免位域) ---
 struct ethhdr {
     unsigned char h_dest[6];
     unsigned char h_source[6];
@@ -17,7 +18,7 @@ struct ethhdr {
 };
 
 struct iphdr {
-    __u8 ihl:4, version:4;
+    __u8 ver_ihl; // 手动处理 version 和 ihl
     __u8 tos;
     __be16 tot_len;
     __be16 id;
@@ -34,7 +35,8 @@ struct tcphdr {
     __be16 dest;
     __be32 seq;
     __be32 ack_seq;
-    __u16 res1:4, doff:4, fin:1, syn:1, rst:1, psh:1, ack:1, urg:1, ece:1, cwr:1;
+    __u8 res1_doff; // 手动处理 doff
+    __u8 flags;
     __be16 window;
     __u16 check;
     __u16 urg_ptr;
@@ -74,38 +76,51 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
 
+    // 1. 解析 Ethernet
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
 
+    // 2. 解析 IP
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
+    // 手动提取 IHL (Header Length)
+    // iph->ver_ihl 的低4位是 IHL
+    __u32 ihl = iph->ver_ihl & 0x0F;
+    if (ihl < 5) return TC_ACT_OK; // 最小长度
+
+    // 3. 解析 TCP
+    // 计算 TCP 头位置: eth + ip_len
+    struct tcphdr *tcph = (void *)iph + (ihl * 4);
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
     
+    // 检查端口映射
     __u16 target_port = bpf_ntohs(tcph->dest);
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
-    if (!(tcph->syn && !tcph->ack)) return TC_ACT_OK;
+    // 检查 SYN 包 (Flags 在第13字节后)
+    // 0x02 是 SYN, 0x10 是 ACK. 我们要 SYN=1, ACK=0
+    if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
-    // --- 1. 在修改数据包之前，先保存需要的信息 ---
+    // --- 准备数据 ---
+    // 提取 TCP Data Offset
+    __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
+    if (doff < 5) return TC_ACT_OK;
+
     struct log_event event = {};
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
     event.src_port = tcph->source;
     event.dst_port = tcph->dest;
-    
-    // --- 关键修复：提前计算好偏移量 ---
-    // 因为下面调用 adjust_room 后，iph 和 tcph 指针将失效！
-    // 我们要写入的位置是：MAC头 + IP头 + TCP头 (即 TCP Payload 的起始位置)
-    __u32 ip_len = iph->ihl * 4;
-    __u32 tcp_len = tcph->doff * 4;
-    __u32 payload_offset = ETH_HLEN + ip_len + tcp_len;
-    
-    // 构造头部数据
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+
+    // 计算插入位置: MAC + IP + TCP
+    // 使用固定值计算，避免验证器认为变量不可控
+    __u32 payload_offset = ETH_HLEN + (ihl * 4) + (doff * 4);
+
     struct pp_v2_header pp_hdr = {};
     __builtin_memcpy(pp_hdr.sig, "\r\n\r\n\0\r\nQUIT\n", 12);
     pp_hdr.ver_cmd = 0x21;
@@ -116,23 +131,18 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
-    // --- 2. 发送日志 ---
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
-    
-    // --- 3. 调整数据包空间 ---
-    // 警告：此函数调用后，eth, iph, tcph 全部失效，不能再使用！
+    // --- 修改数据包 ---
+    // 1. 腾出空间
     if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 4. 写入数据 ---
-    // 使用我们在第 1 步计算好的 payload_offset
-    // 注意：因为我们在 NET 层增加了空间，原本的 TCP 头被推后了
-    // 如果我们要插在 TCP 头之后，这里可能需要更复杂的逻辑移动 TCP 头
-    // 但为了修复 crash，我们先保证 offset 计算是“安全”的（即不引用失效指针）
+    // 2. 写入数据 (使用计算好的安全偏移量)
     if (bpf_skb_store_bytes(skb, payload_offset, &pp_hdr, sizeof(pp_hdr), 0))
         return TC_ACT_SHOT;
 
     return TC_ACT_OK;
 }
 
-char _license[] SEC("license") = "GPL";
+// ❌ 移除这行: char _license[] SEC("license") = "GPL";
+// ✅ 改用这种方式强制定义 License 段，不生成 .rodata map
+SEC("license") const char __license[] = "GPL";
