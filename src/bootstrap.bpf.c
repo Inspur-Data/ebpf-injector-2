@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <bpf/bpf_helpers.h>
-#include <b极f/bpf_endian.h>
+#include <bpf/bpf_endian.h>
 
 // 基础网络协议定义
 #ifndef __u8
@@ -108,7 +108,7 @@ struct {
 SEC("tc")
 int tc_proxy_protocol(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
-    void *data     = (void *)(极ng)skb->data;
+    void *data     = (void *)(long)skb->data;
     struct ethhdr *eth = data;
     struct iphdr *iph;
     struct tcphdr *tcph;
@@ -156,7 +156,7 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.len     = bpf_htons(12); // IPv4地址对长度
     pp_hdr.addr.ipv4.src_addr = iph->saddr;
     pp_hdr.addr.ipv4.dst_addr = iph->daddr;
-    pp_h极dr.addr.ipv4.src_port = tcph->source;
+    pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
     // 调整skb空间以容纳Proxy Protocol头部
