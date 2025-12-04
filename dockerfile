@@ -1,6 +1,6 @@
-# 直接使用和 GitHub Actions 宿主机一致的系统
-# 这样编译出来的程序绝对兼容
-FROM ubuntu:22.04
+# ⚠️ 关键修改：使用最新的 Ubuntu 24.04
+# 这与 GitHub Actions 的最新宿主机环境保持一致 (GLIBC 2.39+)
+FROM ubuntu:24.04
 
 # 安装运行时必要的库
 RUN apt-get update && \
@@ -10,8 +10,9 @@ RUN apt-get update && \
     ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# 这里的路径要对应 Workflow 中编译生成的位置
-# 因为我们在 src 目录下执行 make，生成的文件在 src/bootstrap
+# 复制编译好的程序
+# 确保你的 workflow 里编译生成的位置也是 src/bootstrap
 COPY src/bootstrap /usr/sbin/bootstrap
 
+# 启动命令
 CMD ["/usr/sbin/bootstrap"]
