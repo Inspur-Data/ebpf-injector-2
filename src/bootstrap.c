@@ -7,7 +7,7 @@
 #include <bpf/libbpf.h>
 #include <net/if.h>
 #include <errno.h>
-#include "injector.skel.h" // ！！！ 关键改动：引入自动生成的骨架头文件
+#include "bootstrap.skel.h" // ！！！ 关键：包含正确的骨架文件名
 
 static volatile bool exiting = false;
 
@@ -22,7 +22,7 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
         return;
     }
 
-    char *ports_copy = strdup(ports_str); // strtok会修改原字符串，创建一个副本
+    char *ports_copy = strdup(ports_str);
     if (!ports_copy) {
         perror("strdup");
         return;
@@ -40,7 +40,6 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
                 for (int port = start_port; port <= end_port; port++) {
                     __u16 p = (__u16)port;
                     __u8 v = 1;
-                    // ！！！ 关键改动：使用 libbpf 提供的 map 更新函数
                     bpf_map__update_elem(map, &p, sizeof(p), &v, sizeof(v), BPF_ANY);
                 }
             } else {
@@ -51,7 +50,6 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
             if (port > 0 && port < 65536) {
                 __u16 p = (__u16)port;
                 __u8 v = 1;
-                // ！！！ 关键改动：使用 libbpf 提供的 map 更新函数
                 bpf_map__update_elem(map, &p, sizeof(p), &v, sizeof(v), BPF_ANY);
                 printf("Enabled Proxy Protocol for port %d\n", port);
             } else {
@@ -60,11 +58,11 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
         }
         port_token = strtok(NULL, ",");
     }
-    free(ports_copy); // 释放副本
+    free(ports_copy);
 }
 
 int main(int argc, char **argv) {
-    struct injector_bpf *skel; // ！！！ 关键改动：定义骨架结构体
+    struct bootstrap_bpf *skel; // ！！！ 关键：使用由 bootstrap.skel.h 定义的结构体
     int ifindex, err;
     char *iface;
     char *ports_str;
@@ -83,18 +81,19 @@ int main(int argc, char **argv) {
         perror("if_nametoindex");
         return 1;
     }
-
-    // ！！！ 关键改动：打开、加载并验证 eBPF 程序
-    skel = injector_bpf__open_and_load();
+    
+    // ！！！ 关键：调用正确的骨架函数
+    skel = bootstrap_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "ERROR: Failed to open and load BPF skeleton\n");
         return 1;
     }
 
-    // ！！！ 关键改动：直接通过骨架访问 map
+    // 通过骨架访问 map
     parse_and_update_ports(skel->maps.ports_map, ports_str);
 
-    // ！！！ 关键改动：设置 TC Hook 的 ifindex 并自动附加
+    // ！！！ 关键：通过骨架附加 TC 程序
+    // 注意：这里的 tc_proxy_protocol 是你在 bpf.c 文件中 SEC("tc") 宏下面的函数名
     skel->links.tc_proxy_protocol = bpf_program__attach_tc(skel->progs.tc_proxy_protocol, ifindex, BPF_TC_INGRESS);
     if (!skel->links.tc_proxy_protocol) {
         err = -errno;
@@ -112,9 +111,8 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
-    // ！！！ 关键改动：销毁骨架，它会自动处理所有清理工作
-    injector_bpf__destroy(skel);
+    // ！！！ 关键：调用正确的骨架销毁函数
+    bootstrap_bpf__destroy(skel);
     printf("\nDetached eBPF program and cleaned up.\n");
     return 0;
 }
-
