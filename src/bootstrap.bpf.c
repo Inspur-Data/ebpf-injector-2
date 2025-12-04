@@ -3,9 +3,12 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
-#include <linux/if_ether.h> // 关键：提供了 ETH_P_IP 和 ETH_HLEN 宏
 
-// Proxy Protocol v2 头部结构体 (这个是你自定义的，需要保留)
+// 关键：我们不再包含 <linux/if_ether.h>，而是手动定义需要的宏
+#define ETH_P_IP 0x0800
+#define ETH_HLEN 14
+
+// Proxy Protocol v2 头部结构体 (保留)
 struct pp_v2_header {
     __u8 sig[12];
     __u8 ver_cmd;
@@ -40,7 +43,7 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     struct tcphdr *tcph;
 
     if (data + sizeof(*eth) > data_end) return 0;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return 0; // 现在 ETH_P_IP 已被定义
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return 0; // ETH_P_IP 现在已定义
 
     iph = data + sizeof(*eth);
     if ((void *)iph + sizeof(*iph) > data_end) return 0;
@@ -69,7 +72,7 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
         return 1;
 
-    // 现在 ETH_HLEN 已被定义
+    // ETH_HLEN 现在已定义
     if (bpf_skb_store_bytes(skb, ETH_HLEN + iph->ihl * 4 + tcph->doff * 4, &pp_hdr, sizeof(pp_hdr), 0))
         return 1;
 
