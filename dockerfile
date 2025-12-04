@@ -1,10 +1,12 @@
 # ---- Stage 1: The Builder ----
-FROM debian:bullseye-slim AS builder
+# 1. 切换到 Ubuntu 22.04，获取更新的 Clang 14 和工具链
+FROM ubuntu:22.04 AS builder
 
+# 避免安装过程中的交互提示
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. 安装构建工具
-# 显式添加 ca-certificates 以确保 curl 能正确处理 https
+# 2. 安装依赖
+# Ubuntu 22.04 的软件源里工具更新，对 BPF 支持更好
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
@@ -24,23 +26,29 @@ RUN apt-get update && \
 WORKDIR /src
 COPY . .
 
-# 2. 稳健的下载方式 (分步执行)
-# -f: 遇到 404/500 错误时直接失败，不输出错误页面
-# -L: 跟随重定向
-# -o: 保存为文件，不使用管道，避免掩盖错误
-RUN curl -f -L -o /tmp/btf.tar.xz https://github.com/aquasecurity/btfhub-archive/raw/main/ubuntu/20.04/x86_64/5.8.0-63-generic.btf.tar.xz
-
-# 3. [...](asc_slot://start-slot-1)解压 BTF 文件
-# 这里的 tar 会从刚才下载的文件中解压，并将内容输出到 vmlinux.btf
-RUN tar -xJf /tmp/btf.tar.xz -O > /src/vmlinux.btf
+# 3. 下载 BTF 文件 (使用我们验证过的 raw 链接)
+RUN curl -f -L -o /tmp/btf.tar.xz https://github.com/aquasecurity/btfhub-archive/raw/main/ubuntu/20.04/x86_64/5.8.0-63-generic.btf.tar.xz && \
+    tar -xJf /tmp/btf.tar.xz -O > /src/vmlinux.btf
 
 # 4. 编译
-RUN make build VMLINUX_BTF=/src/vmlinux.btf
+# 加上 V=1 打印详细日志，万一出错方便排查
+# 指定 clang 编译器，确保使用的是我们安装的新版本
+RUN make build VMLINUX_BTF=/src/vmlinux.btf V=1 CLANG=clang
 
 
 # ---- Stage 2: The Final Image ----
-FROM debian:bullseye-slim
+# 运行时也使用 Ubuntu 22.04，保持 GLIBC 版本一致
+FROM ubuntu:22.04
 
+# 安装运行时必须的库 (libelf, zlib)
+# 这一步很重要，否则运行程序可能会报 "libelf.so.1 not found"
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libelf1 \
+    zlib1g && \
+    rm -rf /var/lib/apt/lists/*
+
+# 复制编译好的程序
 COPY --from=builder /src/src/bootstrap /usr/sbin/bootstrap
 
 CMD ["/usr/sbin/bootstrap"]
