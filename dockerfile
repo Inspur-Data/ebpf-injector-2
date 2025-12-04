@@ -3,7 +3,8 @@ FROM debian:bullseye-slim AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. 安装基础构建工具，包括 curl 和 xz-utils，以及修复 stubs-32.h 错误的 g++-multilib
+# 1. 安装依赖
+# 必须包含 curl, xz-utils (下载解压) 和 g++-multilib (解决 stubs-32.h)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
@@ -22,21 +23,20 @@ RUN apt-get update && \
 WORKDIR /src
 COPY . .
 
-# 2. 关键步骤：手动下载一个通用的 vmlinux BTF 文件
-# 因为 Docker 构建环境里没有 /sys/kernel/btf/vmlinux
-# 我们使用 BTFHub 提供的 Ubuntu 22.04 (Kernel 5.15) 的 BTF 文件作为编译基准
-RUN curl -L https://github.com/aquasecurity/btfhub-archive/blob/main/ubuntu/20.04/x86_64/5.8.0-63-generic.btf.tar.xz | \
+# 2. 关键修复：使用 'raw' 链接下载 BTF 文件
+# ❌ 错误链接: .../blob/main/... (这是网页)
+# ✅ 正确链接: .../raw/main/...  (这才是文件)
+RUN curl -L https://github.com/aquasecurity/btfhub-archive/raw/main/ubuntu/20.04/x86_64/5.8.0-63-generic.btf.tar.xz | \
     tar xJ -O > /src/vmlinux.btf
 
-# 3. 编译时指定 VMLINUX_BTF 路径
-# 这样 bpftool 就会用我们下载的文件来生成 vmlinux.h，而不会去报错找不到文件
+# 3. 使用下载的 BTF 文件进行编译
 RUN make build VMLINUX_BTF=/src/vmlinux.btf
 
 
 # ---- Stage 2: The Final Image ----
 FROM debian:bullseye-slim
 
-# 复制编译好的程序到标准目录
+# 复制编译好的二进制文件
 COPY --from=builder /src/src/bootstrap /usr/sbin/bootstrap
 
 CMD ["/usr/sbin/bootstrap"]
