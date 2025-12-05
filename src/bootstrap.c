@@ -16,8 +16,19 @@ static volatile bool exiting = false;
 
 static void sig_handler(int sig) { exiting = true; }
 
+// 🛡️ 日志过滤器：屏蔽掉无用的噪音
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
-    return vfprintf(stderr, format, args);
+    // 创建一个缓冲区来检查日志内容
+    char buf[1024];
+    vsnprintf(buf, sizeof(buf), format, args);
+    
+    // 如果包含那条烦人的 Exclusivity 错误，直接忽略，不打印
+    if (strstr(buf, "Exclusivity flag on")) {
+        return 0;
+    }
+    
+    // 其他日志正常打印到 stderr
+    return fprintf(stderr, "%s", buf);
 }
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
@@ -53,6 +64,7 @@ int main(int argc, char **argv) {
     struct perf_buffer *pb = NULL;
     int ifindex;
     
+    // 设置我们自定义的日志过滤函数
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) return 1;
@@ -63,30 +75,34 @@ int main(int argc, char **argv) {
     ifindex = if_nametoindex(argv[1]);
     if (!ifindex) { perror("if_nametoindex"); return 1; }
 
+    // 使用 open_and_load，如果失败，libbpf 会自动打印详细的 Verifier 日志
     skel = bootstrap_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "!!! FAILED TO LOAD SKELETON !!!\n");
         return 1;
     }
 
-    // 使用骨架访问 map
     parse_and_update_ports(skel->maps.ports_map, argv[2]);
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
-    // 先尝试销毁旧的 hook
-    bpf_tc_hook_destroy(&tc_hook);
+    
+    // 忽略 hook create 的错误，因为它可能已经存在
+    // 我们的日志过滤器会拦截掉 Exclusivity 报错
     bpf_tc_hook_create(&tc_hook);
     
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
+    
+    // 先卸载，确保环境干净
+    bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {
         fprintf(stderr, "Failed to attach TC: %s\n", strerror(errno));
         goto cleanup;
     }
     
-    printf("Running... Press Ctrl+C to stop.\n");
+    printf("Successfully attached eBPF program to %s. Press Ctrl+C to exit.\n", argv[1]);
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 

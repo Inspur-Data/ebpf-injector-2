@@ -56,20 +56,18 @@ struct pp_v2_header {
     } addr;
 };
 
-// --- Map 定义：显式指定 flags 为 0 ---
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);
     __type(key, __u16);
     __type(value, __u8);
-    __uint(map_flags, 0); // 关键：强制无特殊标志
 } ports_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
-    __uint(map_flags, 0); // 关键：强制无特殊标志
+    __uint(max_entries, 128);
 } log_events SEC(".maps");
 
 SEC("tc")
@@ -85,8 +83,9 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
+    // 🛡️ 严格检查：IHL 必须在 5-15 之间
     __u32 ihl = iph->ver_ihl & 0x0F;
-    if (ihl < 5) return TC_ACT_OK;
+    if (ihl < 5 || ihl > 15) return TC_ACT_OK;
 
     struct tcphdr *tcph = (void *)iph + (ihl * 4);
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
@@ -97,10 +96,10 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
 
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
+    // 🛡️ 严格检查：Data Offset 必须在 5-15 之间
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
-    if (doff < 5) return TC_ACT_OK;
+    if (doff < 5 || doff > 15) return TC_ACT_OK;
 
-    // 日志事件
     struct log_event event;
     __builtin_memset(&event, 0, sizeof(event));
     event.src_ip = iph->saddr;
@@ -109,21 +108,23 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     event.dst_port = tcph->dest;
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
+    // 计算写入位置
     __u32 payload_offset = ETH_HLEN + (ihl * 4) + (doff * 4);
+    
+    // 🛡️ 防御性编程：再次确认 payload_offset 没有溢出
+    // 最大头部: 14 + 60 + 60 = 134。如果超过这个值，说明计算有问题，直接放弃
+    if (payload_offset > 150) return TC_ACT_OK;
 
     struct pp_v2_header pp_hdr;
     __builtin_memset(&pp_hdr, 0, sizeof(pp_hdr));
     
-    // ⚠️⚠️⚠️ 关键黑魔法 ⚠️⚠️⚠️
-    // 使用 volatile 指针。这会强制编译器生成 STORE 指令
-    // 而绝对不会生成 .rodata 数据段！
-    volatile __u8 *sig = pp_hdr.sig;
-    sig[0] = 0x0D; sig[1] = 0x0A;
-    sig[2] = 0x0D; sig[3] = 0x0A;
-    sig[4] = 0x00; sig[5] = 0x0D;
-    sig[6] = 0x0A; sig[7] = 0x51;
-    sig[8] = 0x55; sig[9] = 0x49;
-    sig[10] = 0x54; sig[11] = 0x0A;
+    // 手动赋值避免 .rodata
+    pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
+    pp_hdr.sig[2] = 0x0D; pp_hdr.sig[3] = 0x0A;
+    pp_hdr.sig[4] = 0x00; pp_hdr.sig[5] = 0x0D;
+    pp_hdr.sig[6] = 0x0A; pp_hdr.sig[7] = 0x51;
+    pp_hdr.sig[8] = 0x55; pp_hdr.sig[9] = 0x49;
+    pp_hdr.sig[10] = 0x54; pp_hdr.sig[11] = 0x0A;
 
     pp_hdr.ver_cmd = 0x21;
     pp_hdr.fam     = 0x11;
