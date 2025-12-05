@@ -10,7 +10,6 @@
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
 
-// --- 结构体定义 ---
 struct ethhdr {
     unsigned char h_dest[6];
     unsigned char h_source[6];
@@ -57,18 +56,20 @@ struct pp_v2_header {
     } addr;
 };
 
-// --- 现代 Map 定义 (修复构建错误) ---
+// --- Map 定义：显式指定 flags 为 0 ---
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);
     __type(key, __u16);
     __type(value, __u8);
+    __uint(map_flags, 0); // 关键：强制无特殊标志
 } ports_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
+    __uint(map_flags, 0); // 关键：强制无特殊标志
 } log_events SEC(".maps");
 
 SEC("tc")
@@ -99,11 +100,9 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
     if (doff < 5) return TC_ACT_OK;
 
-    // --- 防止生成 .rodata 的关键修改 ---
-    // 不使用 = {} 初始化，改用 memset
+    // 日志事件
     struct log_event event;
     __builtin_memset(&event, 0, sizeof(event));
-    
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
     event.src_port = tcph->source;
@@ -112,17 +111,19 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
 
     __u32 payload_offset = ETH_HLEN + (ihl * 4) + (doff * 4);
 
-    // 同样不使用 = {} 初始化
     struct pp_v2_header pp_hdr;
     __builtin_memset(&pp_hdr, 0, sizeof(pp_hdr));
     
-    // 手动赋值，避免字符串常量
-    pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
-    pp_hdr.sig[2] = 0x0D; pp_hdr.sig[3] = 0x0A;
-    pp_hdr.sig[4] = 0x00; pp_hdr.sig[5] = 0x0D;
-    pp_hdr.sig[6] = 0x0A; pp_hdr.sig[7] = 0x51;
-    pp_hdr.sig[8] = 0x55; pp_hdr.sig[9] = 0x49;
-    pp_hdr.sig[10] = 0x54; pp_hdr.sig[11] = 0x0A;
+    // ⚠️⚠️⚠️ 关键黑魔法 ⚠️⚠️⚠️
+    // 使用 volatile 指针。这会强制编译器生成 STORE 指令
+    // 而绝对不会生成 .rodata 数据段！
+    volatile __u8 *sig = pp_hdr.sig;
+    sig[0] = 0x0D; sig[1] = 0x0A;
+    sig[2] = 0x0D; sig[3] = 0x0A;
+    sig[4] = 0x00; sig[5] = 0x0D;
+    sig[6] = 0x0A; sig[7] = 0x51;
+    sig[8] = 0x55; sig[9] = 0x49;
+    sig[10] = 0x54; sig[11] = 0x0A;
 
     pp_hdr.ver_cmd = 0x21;
     pp_hdr.fam     = 0x11;
