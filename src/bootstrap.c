@@ -16,7 +16,6 @@ static volatile bool exiting = false;
 
 static void sig_handler(int sig) { exiting = true; }
 
-// 打印详细日志的回调
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     return vfprintf(stderr, format, args);
 }
@@ -54,34 +53,32 @@ int main(int argc, char **argv) {
     struct perf_buffer *pb = NULL;
     int ifindex;
     
-    // 1. 开启详细日志
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) return 1;
 
-    // 2. 解除内存限制 (必须)
     struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &r);
 
     ifindex = if_nametoindex(argv[1]);
     if (!ifindex) { perror("if_nametoindex"); return 1; }
 
-    // 3. 加载骨架
     skel = bootstrap_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "!!! FAILED TO LOAD SKELETON !!!\n");
         return 1;
     }
 
+    // 注意：如果使用 Legacy Map，skel->maps.ports_map 可能仍然可用
+    // 如果编译报错，可以使用 bpf_object__find_map_by_name(skel->obj, "ports_map")
     parse_and_update_ports(skel->maps.ports_map, argv[2]);
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
-    bpf_tc_hook_create(&tc_hook); // 忽略错误
+    bpf_tc_hook_create(&tc_hook);
     
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
-    // 先卸载旧的防止冲突
     bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {

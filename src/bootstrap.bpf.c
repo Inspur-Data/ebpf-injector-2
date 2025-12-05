@@ -10,7 +10,36 @@
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
 
-// 简化的结构体定义
+// --- 1. 定义传统 Map 结构 (Legacy Def) ---
+struct bpf_map_def {
+    unsigned int type;
+    unsigned int key_size;
+    unsigned int value_size;
+    unsigned int max_entries;
+    unsigned int map_flags;
+};
+
+// --- 2. 使用 "maps" 段 (注意没有点) 定义 Map ---
+// 这种方式定义的 Map 最“笨”，不会触发 libbpf 的高级操作
+SEC("maps")
+struct bpf_map_def ports_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(__u16),
+    .value_size = sizeof(__u8),
+    .max_entries = 65535,
+    .map_flags = 0, // 强制为 0，避开 Exclusivity 检查
+};
+
+SEC("maps")
+struct bpf_map_def log_events = {
+    .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+    .key_size = sizeof(int),
+    .value_size = sizeof(int),
+    .max_entries = 0, // Perf Event Array 不需要设置 entries，libbpf 会处理
+    .map_flags = 0,
+};
+
+// --- 协议头结构体 (保持不变) ---
 struct ethhdr {
     unsigned char h_dest[6];
     unsigned char h_source[6];
@@ -57,19 +86,6 @@ struct pp_v2_header {
     } addr;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65535);
-    __type(key, __u16);
-    __type(value, __u8);
-} ports_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(int));
-    __uint(value_size, sizeof(int));
-} log_events SEC(".maps");
-
 SEC("tc")
 int tc_proxy_protocol(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
@@ -109,15 +125,13 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
 
     struct pp_v2_header pp_hdr = {};
     
-    // ⚠️⚠️⚠️ 关键修改 ⚠️⚠️⚠️
-    // 不再使用字符串常量 "\r\n\r\n\0\r\nQUIT\n"
-    // 而是手动逐字节赋值，防止编译器生成 .rodata 段
+    // 保持手动赋值，杜绝字符串常量
     pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
     pp_hdr.sig[2] = 0x0D; pp_hdr.sig[3] = 0x0A;
     pp_hdr.sig[4] = 0x00; pp_hdr.sig[5] = 0x0D;
-    pp_hdr.sig[6] = 0x0A; pp_hdr.sig[7] = 0x51; // Q
-    pp_hdr.sig[8] = 0x55; pp_hdr.sig[9] = 0x49; // U, I
-    pp_hdr.sig[10] = 0x54; pp_hdr.sig[11] = 0x0A; // T, \n
+    pp_hdr.sig[6] = 0x0A; pp_hdr.sig[7] = 0x51;
+    pp_hdr.sig[8] = 0x55; pp_hdr.sig[9] = 0x49;
+    pp_hdr.sig[10] = 0x54; pp_hdr.sig[11] = 0x0A;
 
     pp_hdr.ver_cmd = 0x21;
     pp_hdr.fam     = 0x11;
@@ -136,5 +150,5 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     return TC_ACT_OK;
 }
 
-// License 字符串是特殊的，libbpf 会单独处理，不会生成 map，所以这里是安全的
+// License 必须是非 const，防止放入 .rodata
 char _license[] SEC("license") = "GPL";
