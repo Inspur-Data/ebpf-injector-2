@@ -69,17 +69,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 注意：如果使用 Legacy Map，skel->maps.ports_map 可能仍然可用
-    // 如果编译报错，可以使用 bpf_object__find_map_by_name(skel->obj, "ports_map")
+    // 使用骨架访问 map
     parse_and_update_ports(skel->maps.ports_map, argv[2]);
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
+    // 先尝试销毁旧的 hook
+    bpf_tc_hook_destroy(&tc_hook);
     bpf_tc_hook_create(&tc_hook);
     
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
-    bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {
         fprintf(stderr, "Failed to attach TC: %s\n", strerror(errno));
