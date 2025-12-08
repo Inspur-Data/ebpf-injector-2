@@ -10,7 +10,6 @@
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <time.h>
-#include <sys/time.h> // 用于获取毫秒时间
 #include "bootstrap.skel.h"
 #include "common.h"
 
@@ -18,26 +17,14 @@ static volatile bool exiting = false;
 
 static void sig_handler(int sig) { exiting = true; }
 
-// 获取当前时间戳字符串 [HH:MM:SS.ms]
-void log_prefix() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm *tm_info = localtime(&tv.tv_sec);
-    char buffer[26];
-    strftime(buffer, 26, "%H:%M:%S", tm_info);
-    fprintf(stdout, "[%s.%03ld] ", buffer, tv.tv_usec / 1000);
-}
-
-// 包装 printf，自动加时间戳和换行
-#define LOG(fmt, ...) do { log_prefix(); fprintf(stdout, fmt "\n", ##__VA_ARGS__); } while(0)
+// 使用 stderr，确保不缓冲！
+#define LOG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), format, args);
-    // 过滤掉 Exclusivity 噪音
     if (strstr(buf, "Exclusivity flag on")) return 0;
-    // libbpf 日志写到 stderr
-    return vfprintf(stderr, format, args);
+    return fprintf(stderr, "%s", buf);
 }
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
@@ -50,33 +37,58 @@ void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
-    if (!map) return;
+    if (!map) {
+        LOG("ERROR: Map pointer is NULL!");
+        return;
+    }
     
-    LOG("DEBUG: Start parsing ports: '%s'", ports_str);
+    // 打印 Map 的文件描述符，确保它是有效的 (>0)
+    int fd = bpf_map__fd(map);
+    LOG("Start parsing ports: '%s'. Map FD: %d", ports_str, fd);
     
+    if (fd < 0) {
+        LOG("CRITICAL ERROR: Map FD is invalid. Map was not created properly.");
+        return;
+    }
+
     char *ports_copy = strdup(ports_str);
+    if (!ports_copy) { perror("strdup"); return; }
+
+    LOG("String duplicated. Tokenizing...");
+    
     char *p = strtok(ports_copy, ",");
     int count = 0;
 
     while (p) {
-        int start = atoi(p), end = start;
+        // 打印当前的 token，确认 strtok 正常工作
+        LOG("Token found: '%s'", p);
+
+        int start = atoi(p);
+        int end = start;
         char *dash = strchr(p, '-');
         if (dash) end = atoi(dash + 1);
         
-        LOG("DEBUG: Processing range %d-%d", start, end);
+        LOG("Range parsed: %d to %d. Starting loop...", start, end);
         
         for (int port = start; port <= end; port++) {
-            __u16 k = port; __u8 v = 1;
-            // 记录一下更新 Map 是否耗时
-            if (bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY)) {
-                 fprintf(stderr, "Failed to update port %d\n", port);
+            __u16 k = port; 
+            __u8 v = 1;
+            
+            // 打印正在更新哪个端口
+            // LOG("Updating port %d...", port); // 嫌吵可以注释掉这行
+            
+            int ret = bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY);
+            if (ret < 0) {
+                 LOG("Failed to update port %d: %s (errno=%d)", port, strerror(-ret), -ret);
             }
             count++;
         }
+        LOG("Range %d-%d done.", start, end);
+        
         p = strtok(NULL, ",");
     }
     free(ports_copy);
-    LOG("DEBUG: Finished updating ports map. Total ports: %d", count);
+    LOG("Finished updating ports map. Total ports: %d", count);
 }
 
 int main(int argc, char **argv) {
@@ -84,11 +96,9 @@ int main(int argc, char **argv) {
     struct perf_buffer *pb = NULL;
     int ifindex;
 
-    // 1. 🚨 关键：禁用 stdout 缓冲，确保日志通过 kubectl logs 立即显示
+    // 双重保险：禁用缓冲
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
-    
-    LOG("🚀 Starting ebpf-injector...");
     
     libbpf_set_print(libbpf_print_fn);
 
@@ -97,7 +107,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    LOG("DEBUG: Arguments received: iface=%s, ports=%s", argv[1], argv[2]);
+    LOG("Main start. Interface=%s, Ports=%s", argv[1], argv[2]);
 
     struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &r);
@@ -105,34 +115,34 @@ int main(int argc, char **argv) {
     ifindex = if_nametoindex(argv[1]);
     if (!ifindex) { perror("if_nametoindex"); return 1; }
 
-    LOG("DEBUG: Opening and Loading Skeleton (This might take a moment)...");
+    LOG("Loading Skeleton...");
     skel = bootstrap_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "!!! FAILED TO LOAD SKELETON !!!\n");
         return 1;
     }
-    LOG("DEBUG: Skeleton loaded successfully.");
+    LOG("Skeleton loaded.");
 
-    LOG("DEBUG: Updating Maps...");
+    LOG("Calling parse_and_update_ports...");
     parse_and_update_ports(skel->maps.ports_map, argv[2]);
 
+    LOG("Setting up perf buffer...");
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
-    LOG("DEBUG: Creating and Attaching TC Hook...");
+    LOG("Attaching TC hook...");
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
     
-    // 忽略错误
     bpf_tc_hook_create(&tc_hook);
     
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
     bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {
-        fprintf(stderr, "Failed to attach TC: %s\n", strerror(errno));
+        LOG("Failed to attach TC: %s", strerror(errno));
         goto cleanup;
     }
     
-    LOG("✅ Successfully attached eBPF program to %s. Waiting for traffic...", argv[1]);
+    LOG("✅ Successfully attached eBPF program to %s. Waiting...", argv[1]);
     
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
