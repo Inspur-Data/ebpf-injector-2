@@ -61,6 +61,7 @@ struct {
     __uint(max_entries, 65535);
     __type(key, __u16);
     __type(value, __u8);
+    __uint(map_flags, 0);
 } ports_map SEC(".maps");
 
 struct {
@@ -68,6 +69,7 @@ struct {
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
     __uint(max_entries, 128);
+    __uint(map_flags, 0);
 } log_events SEC(".maps");
 
 SEC("tc")
@@ -83,7 +85,6 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    // 🛡️ 严格检查：IHL 必须在 5-15 之间
     __u32 ihl = iph->ver_ihl & 0x0F;
     if (ihl < 5 || ihl > 15) return TC_ACT_OK;
 
@@ -94,9 +95,9 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
+    // 只拦截 SYN 包 (SYN=1, ACK=0)
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
-    // 🛡️ 严格检查：Data Offset 必须在 5-15 之间
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
     if (doff < 5 || doff > 15) return TC_ACT_OK;
 
@@ -108,17 +109,14 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     event.dst_port = tcph->dest;
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
-    // 计算写入位置
+    // 计算插入位置
     __u32 payload_offset = ETH_HLEN + (ihl * 4) + (doff * 4);
-    
-    // 🛡️ 防御性编程：再次确认 payload_offset 没有溢出
-    // 最大头部: 14 + 60 + 60 = 134。如果超过这个值，说明计算有问题，直接放弃
     if (payload_offset > 150) return TC_ACT_OK;
 
     struct pp_v2_header pp_hdr;
     __builtin_memset(&pp_hdr, 0, sizeof(pp_hdr));
     
-    // 手动赋值避免 .rodata
+    // 手动构造头部
     pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
     pp_hdr.sig[2] = 0x0D; pp_hdr.sig[3] = 0x0A;
     pp_hdr.sig[4] = 0x00; pp_hdr.sig[5] = 0x0D;
@@ -134,10 +132,13 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
+    // 1. 调整空间
     if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    if (bpf_skb_store_bytes(skb, payload_offset, &pp_hdr, sizeof(pp_hdr), 0))
+    // 2. 写入数据并更新校验和！
+    // ⚠️ 这里传入 1 (BPF_F_RECOMPUTE_CSUM) 是解决超时的关键！
+    if (bpf_skb_store_bytes(skb, payload_offset, &pp_hdr, sizeof(pp_hdr), 1))
         return TC_ACT_SHOT;
 
     return TC_ACT_OK;
