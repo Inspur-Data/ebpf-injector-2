@@ -14,46 +14,24 @@
 #include "common.h"
 
 static volatile bool exiting = false;
-
 static void sig_handler(int sig) { exiting = true; }
 
-// 日志过滤器
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), format, args);
+    // 过滤掉 Exclusivity 噪音
     if (strstr(buf, "Exclusivity flag on")) return 0;
     return fprintf(stderr, "%s", buf);
 }
 
-// 打印 Hex Dump 的辅助函数
-void print_hex_dump(const unsigned char *data, size_t size) {
-    char ascii[17];
-    size_t i, j;
-    ascii[16] = '\0';
-    fprintf(stderr, "Packet Dump:\n");
-    for (i = 0; i < size; ++i) {
+// --- 打印 Hex Dump ---
+void print_hex(const unsigned char *data, int size) {
+    fprintf(stderr, "HEX: ");
+    for (int i = 0; i < size; i++) {
+        // 打印成 00 11 22 的格式
         fprintf(stderr, "%02X ", data[i]);
-        if (data[i] >= ' ' && data[i] <= '~') {
-            ascii[i % 16] = data[i];
-        } else {
-            ascii[i % 16] = '.';
-        }
-        if ((i + 1) % 8 == 0 || (i + 1) == size) {
-            fprintf(stderr, " ");
-            if ((i + 1) % 16 == 0) {
-                fprintf(stderr, "|  %s \n", ascii);
-            } else if ((i + 1) == size) {
-                ascii[(i + 1) % 16] = '\0';
-                if ((i + 1) % 16 <= 8) {
-                    fprintf(stderr, " ");
-                }
-                for (j = (i + 1) % 16; j < 16; ++j) {
-                    fprintf(stderr, "   ");
-                }
-                fprintf(stderr, "|  %s \n", ascii);
-            }
-        }
     }
+    fprintf(stderr, "\n");
 }
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
@@ -65,8 +43,8 @@ void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     fprintf(stderr, "[LOG] Injected: %s:%d -> %s:%d\n", 
            src, ntohs(e->src_port), dst, ntohs(e->dst_port));
     
-    // 打印包内容
-    print_hex_dump(e->payload, 100);
+    // 打印包内容快照
+    print_hex(e->payload, 64);
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
@@ -92,8 +70,10 @@ int main(int argc, char **argv) {
     struct perf_buffer *pb = NULL;
     int ifindex;
     
+    // 禁用缓冲，确保日志立即显示
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) return 1;
@@ -126,23 +106,5 @@ int main(int argc, char **argv) {
 
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
     bpf_tc_hook_create(&tc_hook);
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
-    bpf_tc_detach(&tc_hook, &tc_opts); 
-    if (bpf_tc_attach(&tc_hook, &tc_opts)) {
-        fprintf(stderr, "Failed to attach TC\n");
-        goto cleanup;
-    }
     
-    printf("Successfully attached to %s\n", argv[1]);
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-
-    while (!exiting) {
-        perf_buffer__poll(pb, 100);
-    }
-
-cleanup:
-    bpf_tc_hook_destroy(&tc_hook);
-    bootstrap_bpf__destroy(skel);
-    return 0;
-}
+    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts,
