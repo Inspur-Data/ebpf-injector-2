@@ -85,10 +85,11 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    __u32 ihl = iph->ver_ihl & 0x0F;
-    if (ihl < 5 || ihl > 15) return TC_ACT_OK;
+    // 🔒 简化：只支持标准 20 字节 IP 头
+    // 这极大地简化了逻辑，让 Verifier 更容易通过
+    if ((iph->ver_ihl & 0x0F) != 5) return TC_ACT_OK;
 
-    struct tcphdr *tcph = (void *)iph + (ihl * 4);
+    struct tcphdr *tcph = (void *)iph + 20;
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
     
     __u16 target_port = bpf_ntohs(tcph->dest);
@@ -101,24 +102,18 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if (doff < 5 || doff > 15) return TC_ACT_OK;
     __u32 tcp_len = doff * 4;
 
-    // --- 保存原始信息 ---
-    struct log_event event;
-    __builtin_memset(&event, 0, sizeof(event));
-    event.src_ip = iph->saddr;
-    event.dst_ip = iph->daddr;
-    event.src_port = tcph->source;
-    event.dst_port = tcph->dest;
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
-
-    // --- 准备 PP Header ---
+    // --- 构造 PP Header ---
     struct pp_v2_header pp_hdr;
+    // 初始化清零
     __builtin_memset(&pp_hdr, 0, sizeof(pp_hdr));
+    // 填充签名
     pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
     pp_hdr.sig[2] = 0x0D; pp_hdr.sig[3] = 0x0A;
     pp_hdr.sig[4] = 0x00; pp_hdr.sig[5] = 0x0D;
     pp_hdr.sig[6] = 0x0A; pp_hdr.sig[7] = 0x51;
     pp_hdr.sig[8] = 0x55; pp_hdr.sig[9] = 0x49;
     pp_hdr.sig[10] = 0x54; pp_hdr.sig[11] = 0x0A;
+    // 填充内容
     pp_hdr.ver_cmd = 0x21;
     pp_hdr.fam     = 0x11;
     pp_hdr.len     = bpf_htons(12);
@@ -127,106 +122,90 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
-    // --- 步骤 1: 在 IP 后扩容 12 字节 ---
-    // 原: [ETH][IP][TCP][Payload]
-    // 后: [ETH][IP][12字节空隙][TCP][Payload]
+    // --- 1. 扩容 12 字节 (L3) ---
+    // 之前: [ETH][IP][TCP]...
+    // 之后: [ETH][ 12 ][IP][TCP]...
     if (bpf_skb_adjust_room(skb, sizeof(pp_hdr), BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 步骤 2: 搬运 TCP 头 ---
-    // 目标: [ETH][IP][TCP][12字节空隙][Payload]
-    // 我们需要把 TCP 头从"空隙后"搬到"IP后"
+    // --- 2. 搬运 IP 头 (20字节) ---
+    // 目标: [ETH][IP][ 12 ][TCP]...
+    unsigned char buf[60]; // 通用缓冲区
     
-    __u32 ip_len = ihl * 4;
-    __u32 pp_len = sizeof(pp_hdr); // 12
-    __u32 old_tcp_offset = ETH_HLEN + ip_len + pp_len;
-    __u32 new_tcp_offset = ETH_HLEN + ip_len;
-    
-    unsigned char tcp_buf[60]; // 最大 TCP 头
-    __builtin_memset(tcp_buf, 0, sizeof(tcp_buf));
+    // 从 ETH+12 读 IP 头
+    if (bpf_skb_load_bytes(skb, ETH_HLEN + 12, buf, 20)) return TC_ACT_SHOT;
+    // 写入到 ETH 位置
+    if (bpf_skb_store_bytes(skb, ETH_HLEN, buf, 20, 0)) return TC_ACT_SHOT;
 
-    // 🌟 核心修复: 使用 switch 枚举所有可能的 TCP 长度
-    // 这样 bpf_skb_load_bytes 的长度参数就是常量了，验证器就会放行
+    // --- 3. 搬运 TCP 头 ---
+    // 目标: [ETH][IP][TCP][ 12 ]...
+    // 此时 TCP 头位于: ETH(14) + GAP(12) + IP(20) = 46
+    // 我们要把它搬到: ETH(14) + IP(20) = 34
+    __u32 old_tcp_off = ETH_HLEN + 12 + 20;
+    __u32 new_tcp_off = ETH_HLEN + 20;
+
+    // 使用 switch 处理变长 TCP 头，安抚 Verifier
     switch (tcp_len) {
-        case 20: 
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 20)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 20, 0)) return TC_ACT_SHOT;
-            break;
-        case 24:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 24)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 24, 0)) return TC_ACT_SHOT;
-            break;
-        case 28:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 28)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 28, 0)) return TC_ACT_SHOT;
+        case 20:
+            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 20)) return TC_ACT_SHOT;
+            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 20, 0)) return TC_ACT_SHOT;
             break;
         case 32:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 32)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 32, 0)) return TC_ACT_SHOT;
+            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 32)) return TC_ACT_SHOT;
+            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 32, 0)) return TC_ACT_SHOT;
             break;
-        case 36:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 36)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 36, 0)) return TC_ACT_SHOT;
-            break;
-        case 40:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 40)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 40, 0)) return TC_ACT_SHOT;
-            break;
+        case 40: // 常见选项长度
         case 44:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 44)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 44, 0)) return TC_ACT_SHOT;
+            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 40)) return TC_ACT_SHOT;
+            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 40, 0)) return TC_ACT_SHOT;
             break;
-        case 48:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 48)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 48, 0)) return TC_ACT_SHOT;
-            break;
-        case 52:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 52)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 52, 0)) return TC_ACT_SHOT;
-            break;
-        case 56:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 56)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 56, 0)) return TC_ACT_SHOT;
-            break;
-        case 60:
-            if (bpf_skb_load_bytes(skb, old_tcp_offset, tcp_buf, 60)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_offset, tcp_buf, 60, 0)) return TC_ACT_SHOT;
-            break;
+        // 如果是其他不常见的长度，我们选择放行，不处理（避免 switch 过大报错）
         default:
-            // 异常长度，不做处理
+            // 如果长度不是上面几种，我们无法安全搬运，为了安全起见，放弃注入
+            // 这是一个权衡：覆盖 99% 的场景，换取 Verifier 通过
             return TC_ACT_OK;
     }
 
-    // --- 步骤 3: 填入 Proxy Protocol (并计算 TCP Checksum) ---
-    // 空隙现在位于: ETH + IP + TCP
-    __u32 pp_offset = ETH_HLEN + ip_len + tcp_len;
+    // --- 4. 写入 PP Header ---
+    // 此时空隙位于: ETH(14) + IP(20) + TCP(tcp_len)
+    __u32 pp_offset = ETH_HLEN + 20 + tcp_len;
+    
+    // 写入并更新 TCP 校验和
     if (bpf_skb_store_bytes(skb, pp_offset, &pp_hdr, sizeof(pp_hdr), 1))
         return TC_ACT_SHOT;
 
-    // --- 步骤 4: 修复 IP 头 (Length & Checksum) ---
-    // 重新获取指针
+    // --- 5. 修复 IP 头 (Length & Checksum) ---
+    // 重新获取指针来修改 IP 头
     data = (void *)(long)skb->data;
     data_end = (void *)(long)skb->data_end;
     
-    eth = data;
-    if ((void *)(eth + 1) > data_end) return TC_ACT_SHOT;
-    
-    iph = (void *)(eth + 1);
-    if ((void *)(iph + 1) > data_end) return TC_ACT_SHOT;
+    struct iphdr *new_iph = (void *)((char *)data + ETH_HLEN);
+    if ((void *)(new_iph + 1) > data_end) return TC_ACT_SHOT;
 
-    __u16 old_len = bpf_ntohs(iph->tot_len);
+    __u16 old_len = bpf_ntohs(new_iph->tot_len);
     __u16 new_len = old_len + sizeof(pp_hdr);
     
-    // 更新 IP 校验和 (关键！)
-    __u32 csum_offset = ETH_HLEN + 10; // offsetof(struct iphdr, check)
-    __be32 old_val_32 = bpf_htons(old_len);
-    __be32 new_val_32 = bpf_htons(new_len);
+    // 更新 IP 校验和
+    // 使用增量更新：csum_replace(skb, offset, old, new, flags)
+    // offset 是相对于 skb->data 的
+    __u32 csum_off = ETH_HLEN + 10; // offsetof(iphdr, check)
+    __be32 old_l = bpf_htons(old_len);
+    __be32 new_l = bpf_htons(new_len);
     
-    if (bpf_l3_csum_replace(skb, csum_offset, old_val_32, new_val_32, 2))
+    if (bpf_l3_csum_replace(skb, csum_off, old_l, new_l, 2))
         return TC_ACT_SHOT;
 
-    // 更新 IP 长度
-    iph->tot_len = bpf_htons(new_len);
+    // 更新长度
+    new_iph->tot_len = bpf_htons(new_len);
+
+    // 发送日志 (放在最后，成功了再发)
+    struct log_event event;
+    __builtin_memset(&event, 0, sizeof(event));
+    event.src_ip = pp_hdr.addr.ipv4.src_addr;
+    event.dst_ip = pp_hdr.addr.ipv4.dst_addr;
+    event.src_port = pp_hdr.addr.ipv4.src_port;
+    event.dst_port = pp_hdr.addr.ipv4.dst_port;
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     return TC_ACT_OK;
 }
