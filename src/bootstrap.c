@@ -19,7 +19,6 @@ static void sig_handler(int sig) { exiting = true; }
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), format, args);
-    // 过滤掉 Exclusivity 噪音
     if (strstr(buf, "Exclusivity flag on")) return 0;
     return fprintf(stderr, "%s", buf);
 }
@@ -28,7 +27,6 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 void print_hex(const unsigned char *data, int size) {
     fprintf(stderr, "HEX: ");
     for (int i = 0; i < size; i++) {
-        // 打印成 00 11 22 的格式
         fprintf(stderr, "%02X ", data[i]);
     }
     fprintf(stderr, "\n");
@@ -43,7 +41,6 @@ void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     fprintf(stderr, "[LOG] Injected: %s:%d -> %s:%d\n", 
            src, ntohs(e->src_port), dst, ntohs(e->dst_port));
     
-    // 打印包内容快照
     print_hex(e->payload, 64);
 }
 
@@ -66,14 +63,13 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
 }
 
 int main(int argc, char **argv) {
-    struct bootstrap_bpf *skel;
+    struct bootstrap_bpf *skel = NULL; // 初始化为 NULL
     struct perf_buffer *pb = NULL;
     int ifindex;
+    int err = 0;
     
-    // 禁用缓冲，确保日志立即显示
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
-    
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) return 1;
@@ -104,7 +100,37 @@ int main(int argc, char **argv) {
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
+    // 声明 hook 和 opts
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
+    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
+
+    // 尝试创建和附加
     bpf_tc_hook_create(&tc_hook);
+    bpf_tc_detach(&tc_hook, &tc_opts); 
     
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts,
+    if (bpf_tc_attach(&tc_hook, &tc_opts)) {
+        fprintf(stderr, "Failed to attach TC\n");
+        goto cleanup;
+    }
+    
+    printf("Successfully attached to %s\n", argv[1]);
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    while (!exiting) {
+        err = perf_buffer__poll(pb, 100);
+        if (err < 0 && err != -EINTR) {
+            fprintf(stderr, "Error polling perf buffer: %s\n", strerror(-err));
+            break;
+        }
+    }
+
+cleanup:
+    // 清理资源时也需要这两个结构体，所以放在这里是安全的
+    // 注意：bpf_tc_hook_destroy 需要重新初始化一下结构体以防万一，或者直接复用上面的变量
+    // 这里为了简单直接复用上面的 tc_hook 变量
+    bpf_tc_hook_destroy(&tc_hook);
+    if (pb) perf_buffer__free(pb); // 释放 perf buffer
+    if (skel) bootstrap_bpf__destroy(skel);
+    return 0;
+}
