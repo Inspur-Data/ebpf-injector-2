@@ -102,13 +102,13 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
 
     __u16 old_ip_tot_len = bpf_ntohs(iph->tot_len);
 
+    // 准备日志结构体，但不急着发
     struct log_event event;
     __builtin_memset(&event, 0, sizeof(event));
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
     event.src_port = tcph->source;
     event.dst_port = tcph->dest;
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     struct pp_v2_header pp_hdr;
     __builtin_memset(&pp_hdr, 0, sizeof(pp_hdr));
@@ -126,28 +126,27 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
-    // --- 1. 扩容 12 字节 ---
-    // 插入位置：L3 header (IP) 之后
-    // 之前: [ETH][IP][TCP]
-    // 之后: [ETH][IP][空白 12][TCP]
-    // IP 头还在原位，不需要动！
+    // 1. 扩容
     if (bpf_skb_adjust_room(skb, 12, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 2. 搬运 TCP 头 ---
+    // 2. 搬运 IP 头
     unsigned char buf[60];
-    
+    // ❌ 之前的错误逻辑：试图从 34 读 IP 头，但那里是空的！
+    // ✅ 正确逻辑：现在不需要搬运 IP 头！因为 adjust_room(NET) 是在 IP 头之后扩容的
+    // IP 头还在原位 (offset 14)，只是后面多出了 12 字节空白
+    // 所以我们只需要搬运 TCP 头来填补 IP 头后面的空白
+
+    // 3. 搬运 TCP 头
     // 旧 TCP 位置: ETH(14) + IP(20) + GAP(12) = 46
-    // 新 TCP 位置: ETH(14) + IP(20) = 34 (填补空白的前面)
+    // 新 TCP 位置: ETH(14) + IP(20) = 34
+    // 我们要把 46 处的数据搬到 34 处
     __u32 old_tcp_off = 46;
     __u32 new_tcp_off = 34;
 
-    // 我们把 TCP 从 46 搬到 34，这样 34~46 这段空白就被 TCP 覆盖了
-    // 而原来的 46~... 位置就腾出来了，变成了新的空白 (位于 TCP 之后)
     switch (tcp_len) {
         case 20:
             if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 20)) return TC_ACT_SHOT;
-            // ⚠️ 注意：搬运时开启校验和更新 (Flag 1)，防止校验和损坏
             if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 20, 1)) return TC_ACT_SHOT;
             break;
         case 32:
@@ -163,44 +162,28 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
             if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 44, 1)) return TC_ACT_SHOT;
             break;
         default:
-            // 未覆盖的长度，不注入，保证包不坏
             return TC_ACT_OK;
     }
 
-    // --- 3. 写入 PP Header ---
-    // 此时 TCP 已经搬到了 [34, 34+tcp_len]
-    // 空白现在位于 TCP 之后: 34 + tcp_len
+    // 4. 写入 PP Header
     __u32 pp_off = 34 + tcp_len;
-    
     if (bpf_skb_store_bytes(skb, pp_off, &pp_hdr, 12, 1)) 
         return TC_ACT_SHOT;
 
-    // --- 4. 修复 IP 头 (长度和校验和) ---
-    // 重新获取指针
-    data = (void *)(long)skb->data;
-    data_end = (void *)(long)skb->data_end;
-    
-    eth = data;
-    if ((void *)(eth + 1) > data_end) return TC_ACT_SHOT;
-    
-    iph = (void *)(eth + 1);
-    if ((void *)(iph + 1) > data_end) return TC_ACT_SHOT;
-
+    // 5. 修复 IP 头
     __u16 new_len = old_ip_tot_len + 12;
     __be32 old_l = bpf_htons(old_ip_tot_len);
     __be32 new_l = bpf_htons(new_len);
     
-    // 更新 IP 校验和
     if (bpf_l3_csum_replace(skb, 24, old_l, new_l, 2))
         return TC_ACT_SHOT;
 
-    // 更新 IP 长度
     __be16 new_len_be = bpf_htons(new_len);
     if (bpf_skb_store_bytes(skb, 16, &new_len_be, 2, 0))
         return TC_ACT_SHOT;
 
-    // --- 5. 修复 TCP 伪首部校验和 ---
-    __u32 tcp_csum_off = 34 + 16; // 新的 TCP 位置(34) + check偏移(16)
+    // 6. 修复 TCP 伪首部校验和
+    __u32 tcp_csum_off = 34 + 16; 
     __u32 old_tcp_seg_len = old_ip_tot_len - 20;
     __u32 new_tcp_seg_len = old_tcp_seg_len + 12;
 
@@ -209,6 +192,12 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
 
     if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum_val, new_csum_val, BPF_F_PSEUDO_HDR))
         return TC_ACT_SHOT;
+
+    // ⚠️⚠️⚠️ 抓包逻辑 ⚠️⚠️⚠️
+    // 修改完成了，现在把整个包的前 100 字节读出来发送给用户态
+    // 这样我们就能在日志里看到最终的包长什么样了
+    bpf_skb_load_bytes(skb, 0, event.payload, 100);
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     return TC_ACT_OK;
 }
