@@ -2,7 +2,7 @@ name: Build and public docker image
 
 on:
   push:
-    branches: "master"
+    branches: "develop"
 
 env:
   REGISTRY: registry.cn-hangzhou.aliyuncs.com
