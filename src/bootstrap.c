@@ -9,7 +9,6 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
-#include <time.h>
 #include "bootstrap.skel.h"
 #include "common.h"
 
@@ -23,26 +22,15 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     return fprintf(stderr, "%s", buf);
 }
 
-// --- 打印 Hex Dump ---
-void print_hex(const unsigned char *data, int size) {
-    fprintf(stderr, "HEX: ");
-    for (int i = 0; i < size; i++) {
-        fprintf(stderr, "%02X ", data[i]);
-    }
-    fprintf(stderr, "\n");
-}
-
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     const struct log_event *e = data;
     char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
     inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst));
     
-    fprintf(stderr, "[LOG] Injected: %s:%d -> %s:%d\n", 
+    // 打印日志证明 TOA 注入逻辑触发了
+    fprintf(stderr, "[LOG] TOA Injected: %s:%d -> %s:%d\n", 
            src, ntohs(e->src_port), dst, ntohs(e->dst_port));
-    
-    // 打印包内容快照
-    print_hex(e->payload, 64);
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
@@ -69,13 +57,15 @@ int main(int argc, char **argv) {
     int ifindex;
     int err;
     
-    // 禁用缓冲
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
     
     libbpf_set_print(libbpf_print_fn);
 
-    if (argc != 3) return 1;
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <interface> <ports>\n", argv[0]);
+        return 1;
+    }
 
     struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &r);
@@ -103,7 +93,6 @@ int main(int argc, char **argv) {
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
-    // ⚠️ 关键修复：手动初始化 TC 结构体，防止 garbage value 导致报错
     struct bpf_tc_hook tc_hook;
     memset(&tc_hook, 0, sizeof(tc_hook));
     tc_hook.sz = sizeof(tc_hook);
@@ -113,12 +102,11 @@ int main(int argc, char **argv) {
     struct bpf_tc_opts tc_opts;
     memset(&tc_opts, 0, sizeof(tc_opts));
     tc_opts.sz = sizeof(tc_opts);
-    tc_opts.prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol);
-
-    // 尝试创建 Hook (忽略错误，可能已存在)
-    bpf_tc_hook_create(&tc_hook);
     
-    // 先卸载旧的
+    // ⚠️⚠️⚠️ 关键修正：这里必须使用 tc_toa_injector ⚠️⚠️⚠️
+    tc_opts.prog_fd = bpf_program__fd(skel->progs.tc_toa_injector);
+
+    bpf_tc_hook_create(&tc_hook);
     bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {
@@ -126,7 +114,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     
-    printf("Successfully attached to %s\n", argv[1]);
+    printf("Successfully attached TOA injector to %s\n", argv[1]);
     
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -140,7 +128,6 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
-    // 清理时同样需要清零结构体 (虽然这里复用了变量)
     bpf_tc_hook_destroy(&tc_hook);
     if (pb) perf_buffer__free(pb);
     if (skel) bootstrap_bpf__destroy(skel);
