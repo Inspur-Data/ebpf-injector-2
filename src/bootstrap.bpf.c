@@ -93,8 +93,8 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     __u16 target_port = bpf_ntohs(tcph->dest);
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
-
-    if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
+    // 改为：必须有 PSH 标志 (0x08)
+    if (!(tcph->flags & 0x08)) return TC_ACT_OK;
 
     // ⚠️ 关键妥协：只支持标准 20 字节 TCP 头
     // 任何带 Option 的 TCP 包（长度>20），我们都不处理，直接放行
