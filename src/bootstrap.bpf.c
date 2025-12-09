@@ -9,6 +9,8 @@
 #define ETH_P_IP 0x0800
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
+#define TCPOPT_TOA  254
+#define TCPOLEN_TOA 8
 
 struct ethhdr {
     unsigned char h_dest[6];
@@ -41,15 +43,11 @@ struct tcphdr {
     __u16 urg_ptr;
 };
 
-// 调试类型枚举
-enum {
-    DBG_NONE = 0,
-    DBG_ETH_PROTO,
-    DBG_IP_VER,
-    DBG_IP_PROTO,
-    DBG_PORT_MISMATCH,
-    DBG_MAP_HIT,
-    DBG_SUCCESS
+struct toa_opt {
+    __u8 kind;
+    __u8 len;
+    __be16 port;
+    __be32 ip;
 };
 
 struct {
@@ -68,15 +66,6 @@ struct {
     __uint(map_flags, 0);
 } log_events SEC(".maps");
 
-static __always_inline void send_debug(struct __sk_buff *skb, int type, int val1, int val2) {
-    struct log_event event;
-    __builtin_memset(&event, 0, sizeof(event));
-    event.src_ip = type; 
-    event.src_port = val1;
-    event.dst_port = val2;
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
-}
-
 SEC("tc")
 int tc_toa_injector(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
@@ -84,51 +73,100 @@ int tc_toa_injector(struct __sk_buff *skb) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
-
-    // 1. 检查以太网类型
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
-        // 如果不是 IP 包，忽略
-        return TC_ACT_OK;
-    }
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
+    if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    // 2. 检查 IP 版本
-    if ((iph->ver_ihl & 0xF0) != 0x40) {
-        return TC_ACT_OK;
-    }
+    if ((iph->ver_ihl & 0x0F) != 5) return TC_ACT_OK;
 
-    // 3. 检查 TCP
-    if (iph->protocol != IPPROTO_TCP) {
-        return TC_ACT_OK;
-    }
-
-    __u32 ihl = iph->ver_ihl & 0x0F;
-    struct tcphdr *tcph = (void *)iph + (ihl * 4);
+    struct tcphdr *tcph = (void *)iph + 20;
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
     
-    // 获取目标端口
-    __u16 dst_port_net = tcph->dest;
-    __u16 dst_port_host = bpf_ntohs(dst_port_net);
+    __u16 target_port = bpf_ntohs(tcph->dest);
+    __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
+    if (!val || *val == 0) return TC_ACT_OK;
 
-    // 4. Map 查找测试
-    // 先查主机序 (32499)
-    __u8 *val_host = bpf_map_lookup_elem(&ports_map, &dst_port_host);
-    // 再查网络序 (0x7EF3)
-    __u8 *val_net = bpf_map_lookup_elem(&ports_map, &dst_port_net);
+    // 仅拦截 SYN 包 (SYN=1, ACK=0)
+    // 0x12 = SYN|ACK (回包), 0x02 = SYN (请求)
+    if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
-    // 只要有一个命中，就说明是我们的包
-    if (val_host || val_net) {
-        send_debug(skb, DBG_MAP_HIT, dst_port_host, dst_port_net);
-        // 这里可以继续执行注入逻辑...
-        return TC_ACT_OK;
+    // ⚠️ 关键修正：支持带 Timestamp 的 TCP 头 ⚠️
+    __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
+    
+    // doff=5 (20 bytes): 标准头
+    // doff=8 (32 bytes): 带 Timestamp
+    // 其他情况暂不处理，防止空间不足
+    if (doff != 5 && doff != 8) return TC_ACT_OK;
+    
+    __u32 tcp_len = doff * 4;
+
+    // 日志
+    struct log_event event;
+    __builtin_memset(&event, 0, sizeof(event));
+    event.src_ip = iph->saddr;
+    event.dst_ip = iph->daddr;
+    event.src_port = tcph->source;
+    event.dst_port = tcph->dest;
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+
+    struct toa_opt toa;
+    toa.kind = TCPOPT_TOA;
+    toa.len = TCPOLEN_TOA;
+    toa.port = tcph->source;
+    toa.ip = iph->saddr;
+
+    // --- 1. 扩容 8 字节 ---
+    // [IP] [GAP 8] [TCP]
+    if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
+        return TC_ACT_SHOT;
+
+    // --- 2. 搬运 TCP 头 ---
+    // 我们要把 TCP 头从 [GAP] 后面搬到 [GAP] 的位置
+    // 这样 GAP 就会跑到 TCP 头后面，正好用来放 TOA
+    
+    // 旧位置: ETH(14) + IP(20) + GAP(8) = 42
+    // 新位置: ETH(14) + IP(20) = 34
+    
+    unsigned char buf[40]; // 足够容纳 32 字节头
+    
+    // ⚠️ 重点：根据实际长度搬运
+    if (tcp_len == 20) {
+        if (bpf_skb_load_bytes(skb, 42, buf, 20)) return TC_ACT_SHOT;
+        // 修改 doff: 5 -> 7 (28 bytes)
+        buf[12] = 0x70; 
+        if (bpf_skb_store_bytes(skb, 34, buf, 20, 1)) return TC_ACT_SHOT;
+    } else {
+        // tcp_len == 32
+        if (bpf_skb_load_bytes(skb, 42, buf, 32)) return TC_ACT_SHOT;
+        // 修改 doff: 8 -> 10 (40 bytes)
+        // 0x80 -> 0xA0
+        // 保留原有的标志位 (res1 低4位)
+        buf[12] = 0xA0 | (buf[12] & 0x0F);
+        if (bpf_skb_store_bytes(skb, 34, buf, 32, 1)) return TC_ACT_SHOT;
     }
 
-    // 5. 没命中 Map，但端口如果是 32499，说明 Map 写入有问题！
-    if (dst_port_host == 32499 || dst_port_net == 32499) {
-        send_debug(skb, DBG_PORT_MISMATCH, dst_port_host, dst_port_net);
-    }
+    // --- 3. 写入 TOA Option ---
+    // 插入位置 = 34 + 原 TCP 长度
+    // 如果是 20，插在 54
+    // 如果是 32，插在 66
+    __u32 toa_offset = 34 + tcp_len;
+    
+    if (bpf_skb_store_bytes(skb, toa_offset, &toa, TCPOLEN_TOA, 1))
+        return TC_ACT_SHOT;
+
+    // --- 4. 修复 TCP 伪首部校验和 ---
+    // IP 长度变了，TCP 伪首部里的长度也要变
+    __u32 tcp_csum_off = 34 + 16; 
+    __u32 old_tcp_seg_len = tcp_len; 
+    __u32 new_tcp_seg_len = tcp_len + 8;
+
+    __be32 old_csum = bpf_htons(old_tcp_seg_len);
+    __be32 new_csum = bpf_htons(new_tcp_seg_len);
+
+    if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum, new_csum, BPF_F_PSEUDO_HDR))
+        return TC_ACT_SHOT;
 
     return TC_ACT_OK;
 }
