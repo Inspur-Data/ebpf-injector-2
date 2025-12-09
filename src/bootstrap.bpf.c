@@ -7,10 +7,12 @@
 #include "common.h"
 
 #define ETH_P_IP 0x0800
+#define ETH_P_8021Q 0x8100
 #define IPPROTO_TCP 6
 #define ETH_HLEN 14
-#define TCPOLEN_TOA 8
+#define VLAN_HLEN 4
 #define TCPOPT_TOA 254
+#define TCPOLEN_TOA 8
 
 struct ethhdr { unsigned char h_dest[6]; unsigned char h_source[6]; __be16 h_proto; };
 struct iphdr { __u8 ver_ihl; __u8 tos; __be16 tot_len; __be16 id; __be16 frag_off; __u8 ttl; __u8 protocol; __u16 check; __be32 saddr; __be32 daddr; };
@@ -40,16 +42,22 @@ int tc_toa_injector(struct __sk_buff *skb) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
 
-    // ⚠️ 坚定不移：IP 头就在 Offset 14
-    struct iphdr *iph = (void *)((char *)data + ETH_HLEN);
+    // --- 1. 动态 VLAN 探测 ---
+    __u32 l3_offset = ETH_HLEN;
+    if (eth->h_proto == bpf_htons(ETH_P_8021Q)) {
+        __u8 *next_byte = (void *)(eth + 1);
+        if ((void *)(next_byte + 1) > data_end) return TC_ACT_OK;
+        if (*next_byte != 0x45) l3_offset += VLAN_HLEN;
+    } else if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+        return TC_ACT_OK;
+    }
+
+    struct iphdr *iph = (void *)((char *)data + l3_offset);
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
-    
-    // 再次确认：这真的是 IP 头吗？
-    if ((iph->ver_ihl & 0xF0) != 0x40) return TC_ACT_OK; // 不是 IPv4，放行
+    if ((iph->ver_ihl & 0xF0) != 0x40) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
-    if ((iph->ver_ihl & 0x0F) != 5) return TC_ACT_OK; // 只支持标准 IP 头
+    if ((iph->ver_ihl & 0x0F) != 5) return TC_ACT_OK;
 
     struct tcphdr *tcph = (void *)iph + 20;
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
@@ -58,25 +66,21 @@ int tc_toa_injector(struct __sk_buff *skb) {
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
-    // 只处理 SYN
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
     __u32 tcp_len = doff * 4;
-    
-    // 只处理我们可以安全搬运的长度
-    if (tcp_len != 20 && tcp_len != 28 && tcp_len != 32 && tcp_len != 40) 
-        return TC_ACT_OK;
+    if (tcp_len < 20 || tcp_len > 60) return TC_ACT_OK;
 
     __u16 old_ip_tot_len = bpf_ntohs(iph->tot_len);
 
-    // 准备日志
+    // 日志
     struct log_event event;
     __builtin_memset(&event, 0, sizeof(event));
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
     event.src_port = tcph->source;
-    event.dst_port = tcp_len; // 记录 TCP 长度，方便排查
+    event.dst_port = tcp_len; // 记录原始长度
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     struct toa_opt toa;
@@ -85,60 +89,51 @@ int tc_toa_injector(struct __sk_buff *skb) {
     toa.port = tcph->source;
     toa.ip = iph->saddr;
 
-    // --- 1. 扩容 ---
+    // --- 2. 扩容 ---
+    // [IP] [GAP 8] [TCP]
     if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 2. 搬运 TCP 头 ---
-    // 此时结构: [ETH 14] [IP 20] [GAP 8] [TCP LEN]
-    // 目标:     [ETH 14] [IP 20] [TCP LEN] [GAP 8]
-    // 我们要把 TCP 头搬到 IP 头紧后面
-    
-    __u32 base = ETH_HLEN; // 14
+    // --- 3. 搬运 TCP 头 (步骤拆解) ---
+    __u32 base = l3_offset;
     __u32 old_tcp_off = base + 20 + 8;
     __u32 new_tcp_off = base + 20;
     unsigned char buf[60];
 
-    // 分情况搬运，并在搬运时修改 Data Offset
-    if (tcp_len == 20) {
-        if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 20)) return TC_ACT_SHOT;
-        buf[12] = 0x70; // 5->7
-        if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 20, 1)) return TC_ACT_SHOT;
-    } else if (tcp_len == 28) { // 你的情况
-        if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 28)) return TC_ACT_SHOT;
-        buf[12] = 0x90 | (buf[12] & 0x0F); // 7->9
-        if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 28, 1)) return TC_ACT_SHOT;
-    } else if (tcp_len == 32) {
-        if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 32)) return TC_ACT_SHOT;
-        buf[12] = 0xA0 | (buf[12] & 0x0F); // 8->10
-        if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 32, 1)) return TC_ACT_SHOT;
-    } else if (tcp_len == 40) {
-        if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 40)) return TC_ACT_SHOT;
-        buf[12] = 0xC0 | (buf[12] & 0x0F); // 10->12
-        if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 40, 1)) return TC_ACT_SHOT;
-    }
+    // 读取旧头
+    if (bpf_skb_load_bytes(skb, old_tcp_off, buf, tcp_len)) return TC_ACT_SHOT;
 
-    // --- 3. 写入 TOA ---
-    // 位置: 14 + 20 + tcp_len
-    if (bpf_skb_store_bytes(skb, base + 20 + tcp_len, &toa, 8, 1))
+    // A. 写入新位置 (Flags = 0，不更新校验和)
+    // 此时新位置的内容和旧位置一模一样，所以校验和状态保持有效
+    if (bpf_skb_store_bytes(skb, new_tcp_off, buf, tcp_len, 0)) return TC_ACT_SHOT;
+
+    // B. 单独修改 Data Offset (Flags = 1，更新校验和)
+    // TCP 头第 12 字节是 res1_doff
+    __u8 old_doff_byte = buf[12];
+    // 计算新值: old + 2 words (8 bytes)
+    // 0x50 -> 0x70, 0x70 -> 0x90, 0xA0 -> 0xC0
+    __u8 new_doff_byte = old_doff_byte + 0x20; 
+    
+    // 只修改这一个字节，让内核自动计算 diff 并更新校验和
+    if (bpf_skb_store_bytes(skb, new_tcp_off + 12, &new_doff_byte, 1, 1))
         return TC_ACT_SHOT;
 
-    // --- 4. 修复 IP 头 ---
-    __u16 new_len = old_ip_tot_len + 8;
-    __be32 old_l = bpf_htons(old_ip_tot_len);
-    __be32 new_l = bpf_htons(new_len);
-    
-    if (bpf_l3_csum_replace(skb, base + 10, old_l, new_l, 2)) return TC_ACT_SHOT;
-    __be16 new_len_be = bpf_htons(new_len);
-    if (bpf_skb_store_bytes(skb, base + 2, &new_len_be, 2, 0)) return TC_ACT_SHOT;
+    // --- 4. 写入 TOA (Flags = 1，更新校验和) ---
+    __u32 toa_offset = base + 20 + tcp_len;
+    if (bpf_skb_store_bytes(skb, toa_offset, &toa, 8, 1))
+        return TC_ACT_SHOT;
 
-    // --- 5. 修复 TCP 校验和 ---
+    // --- 5. 修复 TCP 伪首部校验和 ---
     __u32 tcp_csum_off = base + 20 + 16; 
-    __be32 old_csum = bpf_htons(tcp_len);
-    __be32 new_csum = bpf_htons(tcp_len + 8);
+    __u32 old_tcp_seg = tcp_len;
+    __u32 new_tcp_seg = tcp_len + 8;
+    __be32 old_csum = bpf_htons(old_tcp_seg);
+    __be32 new_csum = bpf_htons(new_tcp_seg);
 
     if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum, new_csum, BPF_F_PSEUDO_HDR))
         return TC_ACT_SHOT;
+
+    // 注意：我们不再手动修复 IP 头，交给内核自动处理
 
     return TC_ACT_OK;
 }
