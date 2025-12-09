@@ -88,16 +88,16 @@ int tc_toa_injector(struct __sk_buff *skb) {
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
-    // 仅拦截 SYN 包 (无 ACK)
+    // 仅拦截 SYN
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
-    // 检查 TCP 头部长度，只支持标准 20 字节
-    // 如果客户端发送了带 Option 的 SYN (如 TimeStamp)，我们为了安全不注入 TOA
-    // 这会覆盖绝大多数情况
+    // ⚠️ 关键修改：支持更多长度
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
-    if (doff != 5) return TC_ACT_OK; 
+    // 只支持 20 (5) 和 32 (8) 字节
+    if (doff != 5 && doff != 8) return TC_ACT_OK;
+    
+    __u32 tcp_len = doff * 4;
 
-    // 准备日志
     struct log_event event;
     __builtin_memset(&event, 0, sizeof(event));
     event.src_ip = iph->saddr;
@@ -106,61 +106,51 @@ int tc_toa_injector(struct __sk_buff *skb) {
     event.dst_port = tcph->dest;
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
-    // 构造 TOA
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;
     toa.port = tcph->source;
     toa.ip = iph->saddr;
 
-    // --- 1. 扩容 8 字节 ---
-    // 此时: [ETH] [IP] [GAP 8] [TCP]
+    // 1. 扩容 8 字节
     if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 2. 搬运 TCP 头 ---
-    // 我们要把 TCP 头从 GAP 后面搬到 GAP 前面 (紧挨着 IP)
-    // 这样 GAP 就会跑到 TCP 后面，成为 TCP Option 的一部分
-    
+    // 2. 搬运 TCP 头
     // 旧位置: ETH(14) + IP(20) + GAP(8) = 42
     // 新位置: ETH(14) + IP(20) = 34
-    
-    unsigned char tcp_buf[20]; // 标准 TCP 头长度
-    
-    // 读取旧 TCP 头
-    if (bpf_skb_load_bytes(skb, 42, tcp_buf, 20)) return TC_ACT_SHOT;
-    
-    // 修改 TCP 头里的 Data Offset
-    // 原来是 5 (20 bytes), 现在加了 8 bytes, 变成 7 (28 bytes)
-    // res1_doff: 高4位是 doff
-    // 5 << 4 = 0x50. 7 << 4 = 0x70.
-    // 我们直接在 buffer 里改，这样写入时 checksum 会基于新值计算
-    tcp_buf[12] = 0x70; // Set Data Offset to 7
+    unsigned char buf[40]; // 足够容纳 32 字节的头
 
-    // 写入新位置 (并更新 TCP Checksum)
-    // ⚠️ 关键: BPF_F_RECOMPUTE_CSUM (1)
-    if (bpf_skb_store_bytes(skb, 34, tcp_buf, 20, 1)) return TC_ACT_SHOT;
+    // ⚠️ 必须根据实际长度搬运
+    if (tcp_len == 20) {
+        if (bpf_skb_load_bytes(skb, 42, buf, 20)) return TC_ACT_SHOT;
+        // 修改 doff: 5 -> 7 (28 bytes)
+        buf[12] = 0x70; 
+        if (bpf_skb_store_bytes(skb, 34, buf, 20, 1)) return TC_ACT_SHOT;
+    } else { // tcp_len == 32
+        if (bpf_skb_load_bytes(skb, 42, buf, 32)) return TC_ACT_SHOT;
+        // 修改 doff: 8 -> 10 (40 bytes)
+        // 8 << 4 = 0x80. 10 (0xA) << 4 = 0xA0.
+        // 保留低4位 (虽然通常是0)
+        buf[12] = 0xA0 | (buf[12] & 0x0F);
+        if (bpf_skb_store_bytes(skb, 34, buf, 32, 1)) return TC_ACT_SHOT;
+    }
 
-    // --- 3. 写入 TOA Option ---
-    // 位置: 34 + 20 = 54 (紧跟在 TCP 头后面)
-    if (bpf_skb_store_bytes(skb, 54, &toa, TCPOLEN_TOA, 1))
+    // 3. 写入 TOA Option
+    // 位置: 34 + tcp_len
+    __u32 toa_offset = 34 + tcp_len;
+    if (bpf_skb_store_bytes(skb, toa_offset, &toa, TCPOLEN_TOA, 1))
         return TC_ACT_SHOT;
 
-    // --- 4. 修复 TCP 伪首部校验和 ---
-    // 因为 TCP Segment 长度增加了 8 字节
-    // IP Total Length 增加了，内核 adjust_room 会自动处理 IP Checksum
-    // 但 TCP Checksum 包含伪首部里的长度，需要手动更新
-    
-    __u32 tcp_csum_off = 34 + 16; 
-    
-    // SYN 包 payload 为 0
-    __u32 old_len = 20;      // 旧 TCP 头长
-    __u32 new_len = 20 + 8;  // 新 TCP 头长 + Option
+    // 4. 修复 TCP 伪首部校验和
+    __u32 tcp_csum_off = 34 + 16;
+    __u32 old_tcp_seg_len = tcp_len;
+    __u32 new_tcp_seg_len = tcp_len + 8;
 
-    __be32 old_csum_val = bpf_htons(old_len);
-    __be32 new_csum_val = bpf_htons(new_len);
+    __be32 old_csum = bpf_htons(old_tcp_seg_len);
+    __be32 new_csum = bpf_htons(new_tcp_seg_len);
 
-    if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum_val, new_csum_val, BPF_F_PSEUDO_HDR))
+    if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum, new_csum, BPF_F_PSEUDO_HDR))
         return TC_ACT_SHOT;
 
     return TC_ACT_OK;
