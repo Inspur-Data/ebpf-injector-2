@@ -89,28 +89,14 @@ int tc_toa_injector(struct __sk_buff *skb) {
     if (!val || *val == 0) return TC_ACT_OK;
 
     // 仅拦截 SYN 包 (SYN=1, ACK=0)
-    // 0x12 = SYN|ACK (回包), 0x02 = SYN (请求)
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
-    // ⚠️ 关键修正：支持带 Timestamp 的 TCP 头 ⚠️
+    // 支持带 Timestamp 的 TCP 头
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
-    
-    // doff=5 (20 bytes): 标准头
-    // doff=8 (32 bytes): 带 Timestamp
-    // 其他情况暂不处理，防止空间不足
     if (doff != 5 && doff != 8) return TC_ACT_OK;
-    
     __u32 tcp_len = doff * 4;
 
-    // 日志
-    struct log_event event;
-    __builtin_memset(&event, 0, sizeof(event));
-    event.src_ip = iph->saddr;
-    event.dst_ip = iph->daddr;
-    event.src_port = tcph->source;
-    event.dst_port = tcph->dest;
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
-
+    // 构造 TOA
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;
@@ -118,55 +104,52 @@ int tc_toa_injector(struct __sk_buff *skb) {
     toa.ip = iph->saddr;
 
     // --- 1. 扩容 8 字节 ---
-    // [IP] [GAP 8] [TCP]
     if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
     // --- 2. 搬运 TCP 头 ---
-    // 我们要把 TCP 头从 [GAP] 后面搬到 [GAP] 的位置
-    // 这样 GAP 就会跑到 TCP 头后面，正好用来放 TOA
-    
     // 旧位置: ETH(14) + IP(20) + GAP(8) = 42
     // 新位置: ETH(14) + IP(20) = 34
-    
-    unsigned char buf[40]; // 足够容纳 32 字节头
-    
-    // ⚠️ 重点：根据实际长度搬运
+    unsigned char buf[40]; 
+
     if (tcp_len == 20) {
         if (bpf_skb_load_bytes(skb, 42, buf, 20)) return TC_ACT_SHOT;
-        // 修改 doff: 5 -> 7 (28 bytes)
-        buf[12] = 0x70; 
+        buf[12] = 0x70; // 5->7
         if (bpf_skb_store_bytes(skb, 34, buf, 20, 1)) return TC_ACT_SHOT;
-    } else {
-        // tcp_len == 32
+    } else { // 32
         if (bpf_skb_load_bytes(skb, 42, buf, 32)) return TC_ACT_SHOT;
-        // 修改 doff: 8 -> 10 (40 bytes)
-        // 0x80 -> 0xA0
-        // 保留原有的标志位 (res1 低4位)
-        buf[12] = 0xA0 | (buf[12] & 0x0F);
+        buf[12] = 0xA0 | (buf[12] & 0x0F); // 8->10
         if (bpf_skb_store_bytes(skb, 34, buf, 32, 1)) return TC_ACT_SHOT;
     }
 
     // --- 3. 写入 TOA Option ---
-    // 插入位置 = 34 + 原 TCP 长度
-    // 如果是 20，插在 54
-    // 如果是 32，插在 66
     __u32 toa_offset = 34 + tcp_len;
-    
     if (bpf_skb_store_bytes(skb, toa_offset, &toa, TCPOLEN_TOA, 1))
         return TC_ACT_SHOT;
 
     // --- 4. 修复 TCP 伪首部校验和 ---
-    // IP 长度变了，TCP 伪首部里的长度也要变
     __u32 tcp_csum_off = 34 + 16; 
     __u32 old_tcp_seg_len = tcp_len; 
     __u32 new_tcp_seg_len = tcp_len + 8;
-
     __be32 old_csum = bpf_htons(old_tcp_seg_len);
     __be32 new_csum = bpf_htons(new_tcp_seg_len);
 
     if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum, new_csum, BPF_F_PSEUDO_HDR))
         return TC_ACT_SHOT;
+
+    // --- ⚠️ 抓取最终结果 ⚠️ ---
+    // 此时包已经改好了，我们重新读取前 64 字节
+    // 包含 ETH(14) + IP(20) + TCP(28/40) + TOA(8)
+    struct log_event event;
+    __builtin_memset(&event, 0, sizeof(event));
+    
+    // 重新获取指针来读 IP (虽然 load_bytes 不需要指针，但我们要填 IP 字段)
+    // 简单起见，直接从 toa 结构体填，或者不填 IP 也没事，主要看 Hex
+    event.src_ip = toa.ip;
+    event.src_port = toa.port;
+    
+    bpf_skb_load_bytes(skb, 0, event.payload, 64);
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     return TC_ACT_OK;
 }

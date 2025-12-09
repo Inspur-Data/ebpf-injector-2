@@ -22,22 +22,25 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     return fprintf(stderr, "%s", buf);
 }
 
+// 打印 Hex
+void print_hex(const unsigned char *data, int size) {
+    fprintf(stderr, "HEX: ");
+    for (int i = 0; i < size; i++) {
+        fprintf(stderr, "%02X ", data[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     const struct log_event *e = data;
-    int type = e->src_ip;
-    int val1 = e->src_port;
-    int val2 = e->dst_port;
-
-    switch (type) {
-        case 5: // DBG_PORT_MISMATCH
-            fprintf(stderr, "[DEBUG] Port Found BUT Map Lookup Failed! Host: %d, Net: %d\n", val1, val2);
-            break;
-        case 6: // DBG_MAP_HIT
-            fprintf(stderr, "[SUCCESS] Map Hit! Traffic captured for port %d\n", val1);
-            break;
-        default:
-            fprintf(stderr, "[DEBUG] Unknown event type: %d\n", type);
-    }
+    char src[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
+    
+    fprintf(stderr, "[LOG] TOA Injected for SrcIP: %s, SrcPort: %d\n", 
+           src, ntohs(e->src_port));
+    
+    // 打印 64 字节快照
+    print_hex(e->payload, 64);
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
@@ -49,16 +52,10 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
         char *dash = strchr(p, '-');
         if (dash) end = atoi(dash + 1);
         for (int port = start; port <= end; port++) {
-            // 写入主机字节序
-            __u16 k = port; 
-            __u8 v = 1;
+            __u16 k = port; __u8 v = 1;
             bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY);
-            fprintf(stderr, "Added port %d (Host Endian) to Map\n", port);
-            
-            // 为了防止大小端问题，我们也写入网络字节序试试
-            __u16 k_net = htons(port);
-            bpf_map__update_elem(map, &k_net, sizeof(k_net), &v, sizeof(v), BPF_ANY);
         }
+        fprintf(stderr, "Enabled ports: %d-%d\n", start, end);
         p = strtok(NULL, ",");
     }
     free(ports_copy);
@@ -71,6 +68,7 @@ int main(int argc, char **argv) {
     
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) return 1;
@@ -121,7 +119,6 @@ int main(int argc, char **argv) {
     }
     
     printf("Successfully attached to %s\n", argv[1]);
-    
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
