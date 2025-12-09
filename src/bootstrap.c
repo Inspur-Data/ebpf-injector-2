@@ -9,30 +9,31 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
-#include <time.h>
 #include "bootstrap.skel.h"
 #include "common.h"
 
 static volatile bool exiting = false;
 static void sig_handler(int sig) { exiting = true; }
 
+// 日志过滤器
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), format, args);
-    // 过滤掉烦人的 Exclusivity 噪音
+    // 过滤掉那些烦人的噪音
     if (strstr(buf, "Exclusivity flag on")) return 0;
     return fprintf(stderr, "%s", buf);
 }
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     const struct log_event *e = data;
-    char src[INET_ADDRSTRLEN];
+    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
     
-    // 只打印最关键的源 IP
     inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
+    inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst));
     
-    fprintf(stderr, "[LOG] TOA Injected for SrcIP: %s, Original Port: %d (TCP Len: %d)\n", 
-           src, ntohs(e->src_port), e->dst_port);
+    // 这里的 dst_port 实际上是我们回传的 TCP Header Length
+    fprintf(stderr, "[LOG] TOA Injected! Src: %s:%d -> %s (TCP Len: %d)\n", 
+           src, ntohs(e->src_port), dst, e->dst_port);
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
@@ -59,8 +60,10 @@ int main(int argc, char **argv) {
     int ifindex;
     int err;
     
+    // 禁用缓冲，确保日志实时输出
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) {
@@ -80,6 +83,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // 强制清零 Flags，防止 Exclusivity 错误
     struct bpf_map *map;
     bpf_object__for_each_map(map, skel->obj) {
         bpf_map__set_map_flags(map, 0);
@@ -94,6 +98,7 @@ int main(int argc, char **argv) {
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
+    // 手动初始化 TC Hook 结构体
     struct bpf_tc_hook tc_hook;
     memset(&tc_hook, 0, sizeof(tc_hook));
     tc_hook.sz = sizeof(tc_hook);
@@ -103,7 +108,7 @@ int main(int argc, char **argv) {
     struct bpf_tc_opts tc_opts;
     memset(&tc_opts, 0, sizeof(tc_opts));
     tc_opts.sz = sizeof(tc_opts);
-    tc_opts.prog_fd = bpf_program__fd(skel->progs.tc_toa_injector);
+    tc_opts.prog_fd = bpf_program__fd(skel->progs.tc_toa_injector); // 确认名字对齐
 
     bpf_tc_hook_create(&tc_hook);
     bpf_tc_detach(&tc_hook, &tc_opts); 
