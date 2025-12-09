@@ -24,13 +24,20 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     const struct log_event *e = data;
-    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
-    inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst));
-    
-    // 打印日志证明 TOA 注入逻辑触发了
-    fprintf(stderr, "[LOG] TOA Injected: %s:%d -> %s:%d\n", 
-           src, ntohs(e->src_port), dst, ntohs(e->dst_port));
+    int type = e->src_ip;
+    int val1 = e->src_port;
+    int val2 = e->dst_port;
+
+    switch (type) {
+        case 5: // DBG_PORT_MISMATCH
+            fprintf(stderr, "[DEBUG] Port Found BUT Map Lookup Failed! Host: %d, Net: %d\n", val1, val2);
+            break;
+        case 6: // DBG_MAP_HIT
+            fprintf(stderr, "[SUCCESS] Map Hit! Traffic captured for port %d\n", val1);
+            break;
+        default:
+            fprintf(stderr, "[DEBUG] Unknown event type: %d\n", type);
+    }
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
@@ -42,10 +49,16 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
         char *dash = strchr(p, '-');
         if (dash) end = atoi(dash + 1);
         for (int port = start; port <= end; port++) {
-            __u16 k = port; __u8 v = 1;
+            // 写入主机字节序
+            __u16 k = port; 
+            __u8 v = 1;
             bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY);
+            fprintf(stderr, "Added port %d (Host Endian) to Map\n", port);
+            
+            // 为了防止大小端问题，我们也写入网络字节序试试
+            __u16 k_net = htons(port);
+            bpf_map__update_elem(map, &k_net, sizeof(k_net), &v, sizeof(v), BPF_ANY);
         }
-        fprintf(stderr, "Enabled ports: %d-%d\n", start, end);
         p = strtok(NULL, ",");
     }
     free(ports_copy);
@@ -55,17 +68,12 @@ int main(int argc, char **argv) {
     struct bootstrap_bpf *skel = NULL;
     struct perf_buffer *pb = NULL;
     int ifindex;
-    int err;
     
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
-    
     libbpf_set_print(libbpf_print_fn);
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <interface> <ports>\n", argv[0]);
-        return 1;
-    }
+    if (argc != 3) return 1;
 
     struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &r);
@@ -102,34 +110,27 @@ int main(int argc, char **argv) {
     struct bpf_tc_opts tc_opts;
     memset(&tc_opts, 0, sizeof(tc_opts));
     tc_opts.sz = sizeof(tc_opts);
-    
-    // ⚠️⚠️⚠️ 关键修正：这里必须使用 tc_toa_injector ⚠️⚠️⚠️
     tc_opts.prog_fd = bpf_program__fd(skel->progs.tc_toa_injector);
 
     bpf_tc_hook_create(&tc_hook);
     bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {
-        fprintf(stderr, "Failed to attach TC: %s\n", strerror(errno));
+        fprintf(stderr, "Failed to attach TC\n");
         goto cleanup;
     }
     
-    printf("Successfully attached TOA injector to %s\n", argv[1]);
+    printf("Successfully attached to %s\n", argv[1]);
     
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
     while (!exiting) {
-        err = perf_buffer__poll(pb, 100);
-        if (err < 0 && err != -EINTR) {
-            fprintf(stderr, "Error polling perf buffer: %s\n", strerror(-err));
-            break;
-        }
+        perf_buffer__poll(pb, 100);
     }
 
 cleanup:
     bpf_tc_hook_destroy(&tc_hook);
-    if (pb) perf_buffer__free(pb);
-    if (skel) bootstrap_bpf__destroy(skel);
+    bootstrap_bpf__destroy(skel);
     return 0;
 }

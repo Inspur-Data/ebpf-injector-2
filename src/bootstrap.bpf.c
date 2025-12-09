@@ -41,6 +41,25 @@ struct tcphdr {
     __u16 urg_ptr;
 };
 
+// 调试类型枚举
+enum {
+    DBG_NONE = 0,
+    DBG_ETH_PROTO,
+    DBG_IP_VER,
+    DBG_IP_PROTO,
+    DBG_PORT_MISMATCH,
+    DBG_MAP_HIT,
+    DBG_SUCCESS
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65535);
+    __type(key, __u16);
+    __type(value, __u8);
+    __uint(map_flags, 0);
+} ports_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(int));
@@ -49,14 +68,14 @@ struct {
     __uint(map_flags, 0);
 } log_events SEC(".maps");
 
-// 占位
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1);
-    __type(key, __u16);
-    __type(value, __u8);
-    __uint(map_flags, 0);
-} ports_map SEC(".maps");
+static __always_inline void send_debug(struct __sk_buff *skb, int type, int val1, int val2) {
+    struct log_event event;
+    __builtin_memset(&event, 0, sizeof(event));
+    event.src_ip = type; 
+    event.src_port = val1;
+    event.dst_port = val2;
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+}
 
 SEC("tc")
 int tc_toa_injector(struct __sk_buff *skb) {
@@ -65,35 +84,51 @@ int tc_toa_injector(struct __sk_buff *skb) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
+
+    // 1. 检查以太网类型
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+        // 如果不是 IP 包，忽略
+        return TC_ACT_OK;
+    }
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
-    if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    // 计算 IP 头长度
+    // 2. 检查 IP 版本
+    if ((iph->ver_ihl & 0xF0) != 0x40) {
+        return TC_ACT_OK;
+    }
+
+    // 3. 检查 TCP
+    if (iph->protocol != IPPROTO_TCP) {
+        return TC_ACT_OK;
+    }
+
     __u32 ihl = iph->ver_ihl & 0x0F;
-    // 计算 TCP 头位置
     struct tcphdr *tcph = (void *)iph + (ihl * 4);
     if ((void *)(tcph + 1) > data_end) return TC_ACT_OK;
     
-    // ⚠️ 侦探逻辑：打印端口 ⚠️
-    // 我们分别打印网络字节序 (Raw) 和主机字节序 (ntohs)
-    
-    struct log_event event;
-    __builtin_memset(&event, 0, sizeof(event));
-    
-    event.src_ip = iph->saddr;
-    event.dst_ip = iph->daddr;
-    
-    // src_port 放 Raw Port (网络字节序)
-    event.src_port = tcph->dest; 
-    // dst_port 放 Host Port (主机字节序)
-    event.dst_port = bpf_ntohs(tcph->dest);
+    // 获取目标端口
+    __u16 dst_port_net = tcph->dest;
+    __u16 dst_port_host = bpf_ntohs(dst_port_net);
 
-    // 无论什么端口，只要是 TCP 就打印！
-    // 这样我们能在日志里搜 "32499" 或者是它的十六进制 "7EF3"
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    // 4. Map 查找测试
+    // 先查主机序 (32499)
+    __u8 *val_host = bpf_map_lookup_elem(&ports_map, &dst_port_host);
+    // 再查网络序 (0x7EF3)
+    __u8 *val_net = bpf_map_lookup_elem(&ports_map, &dst_port_net);
+
+    // 只要有一个命中，就说明是我们的包
+    if (val_host || val_net) {
+        send_debug(skb, DBG_MAP_HIT, dst_port_host, dst_port_net);
+        // 这里可以继续执行注入逻辑...
+        return TC_ACT_OK;
+    }
+
+    // 5. 没命中 Map，但端口如果是 32499，说明 Map 写入有问题！
+    if (dst_port_host == 32499 || dst_port_net == 32499) {
+        send_debug(skb, DBG_PORT_MISMATCH, dst_port_host, dst_port_net);
+    }
 
     return TC_ACT_OK;
 }
