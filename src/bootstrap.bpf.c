@@ -85,7 +85,6 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
     if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
-    // 只支持标准 20 字节 IP 头
     if ((iph->ver_ihl & 0x0F) != 5) return TC_ACT_OK;
 
     struct tcphdr *tcph = (void *)iph + 20;
@@ -95,16 +94,26 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     __u8 *val = bpf_map_lookup_elem(&ports_map, &target_port);
     if (!val || *val == 0) return TC_ACT_OK;
 
-    // 只拦截 SYN (SYN=1, ACK=0)
     if ((tcph->flags & 0x12) != 0x02) return TC_ACT_OK;
 
+    // ⚠️ 关键妥协：只支持标准 20 字节 TCP 头
+    // 任何带 Option 的 TCP 包（长度>20），我们都不处理，直接放行
+    // 这能极大简化逻辑，让 Verifier 闭嘴
     __u32 doff = (tcph->res1_doff & 0xF0) >> 4;
-    if (doff < 5 || doff > 15) return TC_ACT_OK;
-    __u32 tcp_len = doff * 4;
+    if (doff != 5) return TC_ACT_OK; 
 
     __u16 old_ip_tot_len = bpf_ntohs(iph->tot_len);
 
-    // 准备 PP Header
+    // 抓包快照
+    struct log_event event;
+    __builtin_memset(&event, 0, sizeof(event));
+    event.src_ip = iph->saddr;
+    event.dst_ip = iph->daddr;
+    event.src_port = tcph->source;
+    event.dst_port = tcph->dest;
+    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+
+    // 构造 PP Header
     struct pp_v2_header pp_hdr;
     __builtin_memset(&pp_hdr, 0, sizeof(pp_hdr));
     pp_hdr.sig[0] = 0x0D; pp_hdr.sig[1] = 0x0A;
@@ -121,46 +130,25 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     pp_hdr.addr.ipv4.src_port = tcph->source;
     pp_hdr.addr.ipv4.dst_port = tcph->dest;
 
-    // --- 1. 扩容 12 字节 (在 L3 之后插入) ---
+    // 1. 扩容 12 字节
     if (bpf_skb_adjust_room(skb, 12, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 2. 搬运 TCP 头 ---
-    // 旧位置: ETH(14) + IP(20) + GAP(12) = 46
-    // 新位置: ETH(14) + IP(20) = 34
-    unsigned char buf[60];
-    __u32 old_tcp_off = 46;
-    __u32 new_tcp_off = 34;
+    // 2. 搬运 TCP 头 (固定 20 字节)
+    // 旧位置: 46 (14+12+20)
+    // 新位置: 34 (14+20)
+    unsigned char tcp_buf[20];
+    // 读取
+    if (bpf_skb_load_bytes(skb, 46, tcp_buf, 20)) return TC_ACT_SHOT;
+    // 写入 (更新 Checksum)
+    if (bpf_skb_store_bytes(skb, 34, tcp_buf, 20, 1)) return TC_ACT_SHOT;
 
-    switch (tcp_len) {
-        case 20:
-            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 20)) return TC_ACT_SHOT;
-            // ⚠️ 开启 Flag 1 (CSUM)，这步非常关键
-            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 20, 1)) return TC_ACT_SHOT;
-            break;
-        case 32:
-            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 32)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 32, 1)) return TC_ACT_SHOT;
-            break;
-        case 40:
-            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 40)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 40, 1)) return TC_ACT_SHOT;
-            break;
-        case 44:
-            if (bpf_skb_load_bytes(skb, old_tcp_off, buf, 44)) return TC_ACT_SHOT;
-            if (bpf_skb_store_bytes(skb, new_tcp_off, buf, 44, 1)) return TC_ACT_SHOT;
-            break;
-        default:
-            return TC_ACT_OK;
-    }
-
-    // --- 3. 写入 PP Header ---
-    // 位置: 34 + tcp_len
-    __u32 pp_off = 34 + tcp_len;
-    if (bpf_skb_store_bytes(skb, pp_off, &pp_hdr, 12, 1)) 
+    // 3. 写入 PP Header
+    // 位置: 34 + 20 = 54
+    if (bpf_skb_store_bytes(skb, 54, &pp_hdr, 12, 1)) 
         return TC_ACT_SHOT;
 
-    // --- 4. 修复 IP 头 ---
+    // 4. 修复 IP 头
     data = (void *)(long)skb->data;
     data_end = (void *)(long)skb->data_end;
     eth = data;
@@ -176,7 +164,7 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     __be16 new_len_be = bpf_htons(new_len);
     if (bpf_skb_store_bytes(skb, 16, &new_len_be, 2, 0)) return TC_ACT_SHOT;
 
-    // --- 5. 修复 TCP 伪首部校验和 ---
+    // 5. 修复 TCP 伪首部
     __u32 tcp_csum_off = 34 + 16; 
     __u32 old_tcp_seg_len = old_ip_tot_len - 20;
     __u32 new_tcp_seg_len = old_tcp_seg_len + 12;
@@ -186,22 +174,9 @@ int tc_proxy_protocol(struct __sk_buff *skb) {
     if (bpf_l4_csum_replace(skb, tcp_csum_off, old_csum_val, new_csum_val, BPF_F_PSEUDO_HDR))
         return TC_ACT_SHOT;
 
-    // --- ⚠️⚠️⚠️ 抓取修改后的数据包快照 ⚠️⚠️⚠️ ---
-    // 我们把修改完的整个包（前64字节）发给用户态，看看它到底长什么样
-    struct log_event event;
-    __builtin_memset(&event, 0, sizeof(event));
-    
-    // 填充源/目的信息方便辨认
-    event.src_ip = iph->saddr;
-    event.dst_ip = iph->daddr;
-    // 这里的 tcph 指针已经失效了，不能用！
-    // 我们直接从 pp_hdr 里取端口，反正是一样的
-    event.src_port = pp_hdr.addr.ipv4.src_port;
-    event.dst_port = pp_hdr.addr.ipv4.dst_port;
-
-    // 抓取前 64 字节
+    // 再次抓包快照 (最终状态)
+    // 因为 event 在 adjust_room 后可能失效，我们只抓取前64字节内容，不更新 meta
     bpf_skb_load_bytes(skb, 0, event.payload, 64);
-    
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     return TC_ACT_OK;

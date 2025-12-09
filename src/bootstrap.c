@@ -41,6 +41,7 @@ void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     fprintf(stderr, "[LOG] Injected: %s:%d -> %s:%d\n", 
            src, ntohs(e->src_port), dst, ntohs(e->dst_port));
     
+    // 打印包内容快照
     print_hex(e->payload, 64);
 }
 
@@ -63,13 +64,15 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
 }
 
 int main(int argc, char **argv) {
-    struct bootstrap_bpf *skel = NULL; // 初始化为 NULL
+    struct bootstrap_bpf *skel = NULL;
     struct perf_buffer *pb = NULL;
     int ifindex;
-    int err = 0;
+    int err;
     
+    // 禁用缓冲
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    
     libbpf_set_print(libbpf_print_fn);
 
     if (argc != 3) return 1;
@@ -100,20 +103,31 @@ int main(int argc, char **argv) {
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
 
-    // 声明 hook 和 opts
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex = ifindex, .attach_point = BPF_TC_INGRESS);
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_opts, .prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol));
+    // ⚠️ 关键修复：手动初始化 TC 结构体，防止 garbage value 导致报错
+    struct bpf_tc_hook tc_hook;
+    memset(&tc_hook, 0, sizeof(tc_hook));
+    tc_hook.sz = sizeof(tc_hook);
+    tc_hook.ifindex = ifindex;
+    tc_hook.attach_point = BPF_TC_INGRESS;
 
-    // 尝试创建和附加
+    struct bpf_tc_opts tc_opts;
+    memset(&tc_opts, 0, sizeof(tc_opts));
+    tc_opts.sz = sizeof(tc_opts);
+    tc_opts.prog_fd = bpf_program__fd(skel->progs.tc_proxy_protocol);
+
+    // 尝试创建 Hook (忽略错误，可能已存在)
     bpf_tc_hook_create(&tc_hook);
+    
+    // 先卸载旧的
     bpf_tc_detach(&tc_hook, &tc_opts); 
     
     if (bpf_tc_attach(&tc_hook, &tc_opts)) {
-        fprintf(stderr, "Failed to attach TC\n");
+        fprintf(stderr, "Failed to attach TC: %s\n", strerror(errno));
         goto cleanup;
     }
     
     printf("Successfully attached to %s\n", argv[1]);
+    
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
@@ -126,11 +140,9 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
-    // 清理资源时也需要这两个结构体，所以放在这里是安全的
-    // 注意：bpf_tc_hook_destroy 需要重新初始化一下结构体以防万一，或者直接复用上面的变量
-    // 这里为了简单直接复用上面的 tc_hook 变量
+    // 清理时同样需要清零结构体 (虽然这里复用了变量)
     bpf_tc_hook_destroy(&tc_hook);
-    if (pb) perf_buffer__free(pb); // 释放 perf buffer
+    if (pb) perf_buffer__free(pb);
     if (skel) bootstrap_bpf__destroy(skel);
     return 0;
 }
