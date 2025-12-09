@@ -9,6 +9,15 @@
 #define ETH_P_IP 0x0800
 #define IPPROTO_TCP 6
 
+// --- 补回丢失的 Map 定义 ---
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(int));
+    __uint(value_size, sizeof(int));
+    __uint(max_entries, 128);
+    __uint(map_flags, 0);
+} log_events SEC(".maps");
+
 // 诊断模式：只读，不注入
 SEC("tc")
 int tc_toa_injector(struct __sk_buff *skb) {
