@@ -6,13 +6,13 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
-#include <linux/pkt_cls.h> // 修复 #1: 包含此头文件以定义 TC_ACT_OK 和 TC_ACT_SHOT
+#include <linux/pkt_cls.h> // 包含 TC_ACT_* 定义
 
 #include "common.h"
 
-// 修复 #2: 添加缺失的 TOA 选项定义
-#define TCPOPT_TOA 254      // TOA 选项的 Kind 值
-#define TCPOLEN_TOA 8       // TOA 选项的长度 (Kind + Len + Port + IP = 1+1+2+4 = 8)
+// TOA 选项定义
+#define TCPOPT_TOA 254
+#define TCPOLEN_TOA 8
 struct toa_opt {
     __u8 kind;
     __u8 len;
@@ -20,7 +20,7 @@ struct toa_opt {
     __be32 ip;
 };
 
-// 修复 #3: 明确定义 eBPF maps
+// eBPF Maps 定义
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);
@@ -33,7 +33,6 @@ struct {
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } log_events SEC(".maps");
-// --- 所有修复完成 ---
 
 
 SEC("tc")
@@ -102,36 +101,41 @@ int tc_toa_injector(struct __sk_buff *skb) {
     if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // 指针失效，必须重新加载所有指针！
+    // --- 指针失效，必须重新加载所有指针！ ---
     data_end = (void *)(long)skb->data_end;
     data = (void *)(long)skb->data;
     iph = (struct iphdr *)(data + ip_offset);
     if ((void *)iph + sizeof(*iph) > data_end)
         return TC_ACT_SHOT;
     
-    tcph = (struct tcphdr *)((void *)iph + ip_hdr_len);
-    if ((void *)tcph + sizeof(*tcph) > data_end)
-        return TC_ACT_SHOT;
-
-    // 更新 IP 头总长度
+    // --- L3 (IP) 头部修正 ---
     __be16 new_tot_len = bpf_htons(bpf_ntohs(iph->tot_len) + TCPOLEN_TOA);
     bpf_l3_csum_replace(skb, ip_offset + offsetof(struct iphdr, check), iph->tot_len, new_tot_len, sizeof(new_tot_len));
     bpf_skb_store_bytes(skb, ip_offset + offsetof(struct iphdr, tot_len), &new_tot_len, sizeof(new_tot_len), 0);
 
-    // 更新 TCP 头长度 (doff)
-    __u8 new_doff = ((old_tcp_len + TCPOLEN_TOA) / 4) << 4;
-    bpf_l4_csum_replace(skb, ip_offset + ip_hdr_len + offsetof(struct tcphdr, check), (__be32)tcph->doff << 8, (__be32)new_doff << 8, sizeof(new_doff));
-    bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + offsetof(struct tcphdr, doff), &new_doff, sizeof(new_doff), 0);
+    // --- L4 (TCP) 头部修正 (已简化并修复) ---
     
-    // 写入 TOA 选项，并让内核自动重算校验和
-    bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + old_tcp_len, &toa, TCPOLEN_TOA, BPF_F_RECOMPUTE_CSUM);
+    // 1. 准备新的 TCP Data Offset (doff) 字节
+    //    doff 位于 TCP 头第 12 字节的高 4 位。
+    __u8 new_doff_byte = ((old_tcp_len + TCPOLEN_TOA) / 4) << 4; 
 
-    // 记录日志
+    // 2. 写入新的 doff 字节。
+    //    使用硬编码的 TCP 头部偏移量 12，因为 `offsetof` 不能用于位域 `doff`。
+    bpf_skb_store_bytes(skb, ip_offset + iph->ihl * 4 + 12, &new_doff_byte, sizeof(new_doff_byte), 0);
+    
+    // 3. 写入 TOA 选项，并让内核重算 L4 校验和。
+    //    BPF_F_RECOMPUTE_CSUM 标志会自动处理所有影响校验和的因素：
+    //    a) doff 值的改变
+    //    b) 新增的 TOA 选项内容
+    //    c) IP 层长度改变导致的伪首部变化
+    bpf_skb_store_bytes(skb, ip_offset + iph->ihl * 4 + old_tcp_len, &toa, TCPOLEN_TOA, BPF_F_RECOMPUTE_CSUM);
+
+    // 4. 记录日志
     struct log_event event;
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
     event.src_port = tcph->source;
-    event.dst_port = old_tcp_len; // 回传原始TCP头长
+    event.dst_port = old_tcp_len;
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     return TC_ACT_OK;
