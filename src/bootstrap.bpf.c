@@ -68,58 +68,54 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     if ((void *)iph + sizeof(*iph) > data_end) return XDP_PASS;
     if (iph->protocol != IPPROTO_TCP) return XDP_PASS;
 
+    // --- Verifier 修复关键点 1: 限制 ip_hdr_len ---
     ip_hdr_len = iph->ihl * 4;
+    // 限制最大值为 60 (0x3C)，与 0x3F 按位与可以告诉 Verifier 它的上限
+    ip_hdr_len &= 0x3F; 
+    
     if (ip_hdr_len < sizeof(*iph)) return XDP_PASS;
 
     tcph = (void *)iph + ip_hdr_len;
     if ((void *)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
 
-    // 端口匹配
     if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) return XDP_PASS;
     
     if (!(tcph->syn && !tcph->ack)) return XDP_PASS;
 
     tcp_hdr_len = tcph->doff * 4;
-    // 确保有足够空间容纳标准选项 (MSS 4 + SACK 2 + TS 10 = 16字节选项 + 20字节头 = 36)
     if (tcp_hdr_len < 36) return XDP_PASS;
 
     source_ip = iph->saddr;
     dest_ip = iph->daddr;
     source_port = tcph->source;
 
-    // --- 构造替换块 (10 字节) ---
-    // [TOA (8 bytes)] + [NOP (1 byte)] + [NOP (1 byte)]
-    // 这将完美替换掉 Timestamp 选项 (10 bytes)
     __u8 new_block[10];
-    
-    // 1. 填入 TOA
     struct toa_opt *toa = (struct toa_opt *)new_block;
     toa->kind = TCPOPT_TOA;
     toa->len = TCPOLEN_TOA;
     toa->port = source_port;
     toa->ip = source_ip;
-    
-    // 2. 填入 NOP 填充尾部
     new_block[8] = TCPOPT_NOP;
     new_block[9] = TCPOPT_NOP;
 
-    // --- 修改点：计算偏移量 ---
-    // 从 24 改为 26，跳过 MSS(4) 和 SACK(2)
+    // --- Verifier 修复关键点 2: 重新计算 toa_offset ---
+    // 此时 Verifier 知道 ip_hdr_len 是有界的，计算应该是安全的
     toa_offset = ip_offset + ip_hdr_len + 26; 
     
     // --- 边界检查 ---
-    if (data + toa_offset + 10 > data_end) return XDP_PASS;
+    // 将指针运算拆解，帮助 Verifier 理解
+    void *toa_ptr = data + toa_offset;
+    if (toa_ptr + 10 > data_end) return XDP_PASS;
 
-    // --- 读取旧数据 (10字节) ---
     __u8 old_data[10];
-    __builtin_memcpy(old_data, data + toa_offset, 10);
+    // 使用验证过的指针读取
+    __builtin_memcpy(old_data, toa_ptr, 10);
 
-    // --- 写入新数据 ---
-    // 我们的操作不改变包长度，且在 XDP 线性区，直接写入
-    if (data + toa_offset + 10 <= data_end) {
-        __builtin_memcpy(data + toa_offset, new_block, 10);
+    // 写入新数据
+    // 再次检查 (虽然逻辑上冗余，但对 Verifier 有帮助)
+    if (toa_ptr + 10 <= data_end) {
+        __builtin_memcpy(toa_ptr, new_block, 10);
         
-        // --- 重新计算校验和 ---
         tcph = (void *)data + ip_offset + ip_hdr_len;
         if ((void*)tcph + sizeof(*tcph) <= data_end) {
              update_tcp_csum(tcph, old_data, new_block, 10);
