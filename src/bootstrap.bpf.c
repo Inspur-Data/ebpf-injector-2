@@ -46,7 +46,7 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     struct iphdr *iph;
     struct tcphdr *tcph;
     
-    __u32 ip_offset, ip_hdr_len, tcp_hdr_len, toa_offset;
+    __u32 ip_offset, ip_hdr_len, tcp_hdr_len;
     __u16 h_proto;
     __be32 source_ip, dest_ip;
     __be16 source_port;
@@ -68,14 +68,12 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     if ((void *)iph + sizeof(*iph) > data_end) return XDP_PASS;
     if (iph->protocol != IPPROTO_TCP) return XDP_PASS;
 
-    // --- Verifier 修复关键点 1: 限制 ip_hdr_len ---
+    // --- 极简处理：我们只处理标准 IP 头 (20字节) ---
+    // 这大大简化了 Verifier 的路径分析
     ip_hdr_len = iph->ihl * 4;
-    // 限制最大值为 60 (0x3C)，与 0x3F 按位与可以告诉 Verifier 它的上限
-    ip_hdr_len &= 0x3F; 
-    
-    if (ip_hdr_len < sizeof(*iph)) return XDP_PASS;
+    if (ip_hdr_len != 20) return XDP_PASS;
 
-    tcph = (void *)iph + ip_hdr_len;
+    tcph = (void *)iph + 20; // 直接用常数 20
     if ((void *)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
 
     if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) return XDP_PASS;
@@ -83,7 +81,8 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     if (!(tcph->syn && !tcph->ack)) return XDP_PASS;
 
     tcp_hdr_len = tcph->doff * 4;
-    if (tcp_hdr_len < 36) return XDP_PASS;
+    // 限制 TCP 头最大长度，防止溢出
+    if (tcp_hdr_len < 36 || tcp_hdr_len > 60) return XDP_PASS;
 
     source_ip = iph->saddr;
     dest_ip = iph->daddr;
@@ -98,13 +97,15 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     new_block[8] = TCPOPT_NOP;
     new_block[9] = TCPOPT_NOP;
 
-    // --- Verifier 修复关键点 2: 重新计算 toa_offset ---
-    // 此时 Verifier 知道 ip_hdr_len 是有界的，计算应该是安全的
-    toa_offset = ip_offset + ip_hdr_len + 26; 
+    // --- 极其保守的指针计算 ---
+    // 我们的目标位置是：Ethernet(14) + IP(20) + TCP_Base(20) + Offset(6) = 60
+    // 如果有 VLAN，则加 4
+    __u32 base_offset = ip_offset + 20 + 26; 
     
-    // --- 边界检查 ---
-    // 将指针运算拆解，帮助 Verifier 理解
-    void *toa_ptr = data + toa_offset;
+    // 这里的 base_offset 几乎是一个常数，Verifier 应该能接受
+    void *toa_ptr = data + base_offset;
+
+    // 边界检查：确保我们要写的 10 字节都在包内
     if (toa_ptr + 10 > data_end) return XDP_PASS;
 
     __u8 old_data[10];
@@ -112,14 +113,14 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     __builtin_memcpy(old_data, toa_ptr, 10);
 
     // 写入新数据
-    // 再次检查 (虽然逻辑上冗余，但对 Verifier 有帮助)
-    if (toa_ptr + 10 <= data_end) {
-        __builtin_memcpy(toa_ptr, new_block, 10);
-        
-        tcph = (void *)data + ip_offset + ip_hdr_len;
-        if ((void*)tcph + sizeof(*tcph) <= data_end) {
-             update_tcp_csum(tcph, old_data, new_block, 10);
-        }
+    __builtin_memcpy(toa_ptr, new_block, 10);
+    
+    // 重新获取 TCP 头指针用于校验和
+    // 既然我们没有 adjust_head，data 指针没变，直接计算即可
+    // tcph 已经在前面验证过，但在 XDP 中，再次验证是好习惯
+    void *tcph_ptr = (void*)data + ip_offset + 20;
+    if (tcph_ptr + sizeof(struct tcphdr) <= data_end) {
+         update_tcp_csum((struct tcphdr *)tcph_ptr, old_data, new_block, 10);
     }
 
     struct log_event event = {
