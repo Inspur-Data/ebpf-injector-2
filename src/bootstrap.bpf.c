@@ -10,13 +10,11 @@
 
 #include "common.h"
 
-// --- BUG FIX #1: 添加缺失的 VLAN header 定义 ---
 struct vlan_hdr {
     __be16 h_vlan_TCI;
     __be16 h_vlan_encapsulated_proto;
 };
 
-// TOA option definition
 #define TCPOPT_TOA 254
 #define TCPOLEN_TOA 8
 struct toa_opt {
@@ -26,7 +24,6 @@ struct toa_opt {
     __be32 ip;
 };
 
-// eBPF map definitions
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);
@@ -39,7 +36,6 @@ struct {
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } log_events SEC(".maps");
-
 
 SEC("tc")
 int tc_toa_injector(struct __sk_buff *skb) {
@@ -62,21 +58,17 @@ int tc_toa_injector(struct __sk_buff *skb) {
 
     if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
 
-    // --- BUG FIX #2: 使用更健壮的逻辑正确处理 VLAN 头部 ---
     h_proto = eth->h_proto;
     ip_offset = sizeof(*eth);
 
     if (h_proto == bpf_htons(ETH_P_8021Q)) {
         struct vlan_hdr *vlan = (void *)eth + sizeof(*eth);
-        if ((void *)vlan + sizeof(*vlan) > data_end)
-            return TC_ACT_OK;
-        h_proto = vlan->h_vlan_encapsulated_proto; // 读取真正的 L3 协议
-        ip_offset += sizeof(*vlan);             // 增加 VLAN 头部的偏移量
+        if ((void *)vlan + sizeof(*vlan) > data_end) return TC_ACT_OK;
+        h_proto = vlan->h_vlan_encapsulated_proto;
+        ip_offset += sizeof(*vlan);
     }
 
-    if (h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
-    // --- VLAN 逻辑修正完毕 ---
+    if (h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
 
     iph = (struct iphdr *)(data + ip_offset);
     if ((void *)iph + sizeof(*iph) > data_end) return TC_ACT_OK;
@@ -89,13 +81,11 @@ int tc_toa_injector(struct __sk_buff *skb) {
     tcph = (struct tcphdr *)((void *)iph + ip_hdr_len);
     if ((void *)tcph + sizeof(*tcph) > data_end) return TC_ACT_OK;
     
-    // --- BUG FIX #3: 恢复被错误删除的字节序转换 ---
     target_port = bpf_ntohs(tcph->dest);
     if (!bpf_map_lookup_elem(&ports_map, &target_port)) return TC_ACT_OK;
     
     if (!(tcph->syn && !tcph->ack)) return TC_ACT_OK;
     
-    // --- 将所有未来需要的值，从指针复制到安全的局部变量 ---
     old_tcp_len = tcph->doff * 4;
     if (old_tcp_len < sizeof(*tcph)) return TC_ACT_OK;
     
@@ -120,9 +110,15 @@ int tc_toa_injector(struct __sk_buff *skb) {
     bpf_l3_csum_replace(skb, ip_offset + offsetof(struct iphdr, check), old_tot_len, new_tot_len, sizeof(new_tot_len));
     bpf_skb_store_bytes(skb, ip_offset + offsetof(struct iphdr, tot_len), &new_tot_len, sizeof(new_tot_len), 0);
 
-    __u8 new_doff_byte = ((old_tcp_len + TCPOLEN_TOA) / 4) << 4; 
+    // --- 最终的、最健壮的 TCP Doff 修正逻辑 ---
+    __u8 old_doff_byte;
+    if (bpf_skb_load_bytes(skb, ip_offset + ip_hdr_len + 12, &old_doff_byte, 1) < 0)
+        return TC_ACT_SHOT;
+    
+    __u8 new_doff_byte = ((old_doff_byte >> 4) + (TCPOLEN_TOA / 4)) << 4;
     bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + 12, &new_doff_byte, sizeof(new_doff_byte), 0);
     
+    // 写入 TOA，并让内核重算校验和
     bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + old_tcp_len, &toa, TCPOLEN_TOA, BPF_F_RECOMPUTE_CSUM);
 
     struct log_event event;

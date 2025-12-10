@@ -12,15 +12,12 @@
 #include "bootstrap.skel.h"
 #include "common.h"
 
-// 全局变量，用于信号处理，优雅地退出程序
 static volatile bool exiting = false;
 
-// 信号处理函数
 static void sig_handler(int sig) {
     exiting = true;
 }
 
-// libbpf 的日志回调函数，可以过滤掉一些不必要的信息
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
     if (level > LIBBPF_WARN) {
         return 0;
@@ -28,7 +25,6 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     return vfprintf(stderr, format, args);
 }
 
-// perf buffer 的事件处理回调函数，当 eBPF 程序发送数据时被调用
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     const struct log_event *e = data;
     char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
@@ -36,11 +32,10 @@ void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
     inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
     inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst));
     
-    fprintf(stdout, "[LOG] TOA Injected! Src: %s:%d -> Dst: %s (Original TCP Hdr Len: %d)\n", 
+    fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Original TCP Hdr Len: %u)\n", 
            src, ntohs(e->src_port), dst, e->dst_port);
 }
 
-// 解析用户输入的端口字符串并更新 eBPF map
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
     if (!map) return;
     char *ports_copy = strdup(ports_str);
@@ -109,11 +104,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    struct bpf_map *map;
-    bpf_object__for_each_map(map, skel->obj) {
-        bpf_map__set_map_flags(map, 0);
-    }
-
     if (bootstrap_bpf__load(skel)) {
         fprintf(stderr, "ERROR: Failed to load BPF skeleton\n");
         err = 1;
@@ -133,15 +123,12 @@ int main(int argc, char **argv) {
     tc_hook.ifindex = ifindex;
     tc_hook.attach_point = BPF_TC_INGRESS;
 
-    // --- 最终的、健壮的 TC Hook 创建逻辑 ---
     if (bpf_tc_hook_create(&tc_hook) < 0) {
-        // 如果错误不是 EEXIST (File exists)，那才是真正的错误
         if (errno != EEXIST) {
             fprintf(stderr, "ERROR: Failed to create TC hook on interface %s: %s\n", argv[1], strerror(errno));
             err = 1;
             goto cleanup;
         }
-        // 如果错误是 EEXIST，说明 hook 已经在了，这是好事，打印一条信息然后继续即可
         fprintf(stderr, "INFO: TC hook already exists on interface %s. Continuing.\n", argv[1]);
     }
 
@@ -168,10 +155,9 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    fprintf(stdout, "\nExiting...\n");
 
 cleanup:
-    fprintf(stdout, "Detaching TC program and cleaning up resources...\n");
+    fprintf(stdout, "\nExiting... Detaching TC program and cleaning up resources...\n");
     if (tc_hook.ifindex) {
         bpf_tc_hook_destroy(&tc_hook);
     }
