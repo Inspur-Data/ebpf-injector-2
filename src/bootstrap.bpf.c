@@ -32,29 +32,32 @@ struct {
     __uint(value_size, sizeof(int));
 } log_events SEC(".maps");
 
+
 SEC("tc")
 int tc_toa_injector(struct __sk_buff *skb) {
-    // --- 1. "Parse First" 阶段：读取所有需要的值并检查 ---
+    // --- 1. "Parse First" 阶段：读取所有需要的值到局部变量 ---
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
     struct ethhdr *eth = data;
     struct iphdr *iph;
     struct tcphdr *tcph;
     
-    __u16 h_proto;
+    // --- 声明所有需要“跨越”adjust_room的变量 ---
     __u32 ip_offset;
     __u32 ip_hdr_len;
     __u32 old_tcp_len;
     __be16 old_tot_len;
+    __be32 source_ip;
+    __be32 dest_ip;
+    __be16 source_port;
 
     if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
 
-    h_proto = eth->h_proto;
-    ip_offset = sizeof(*eth);
-
-    if (h_proto == bpf_htons(ETH_P_8021Q)) {
-        ip_offset += 4;
-    } else if (h_proto != bpf_htons(ETH_P_IP)) {
+    if (eth->h_proto == bpf_htons(ETH_P_8021Q)) {
+        ip_offset = sizeof(*eth) + sizeof(struct vlan_hdr);
+    } else if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        ip_offset = sizeof(*eth);
+    } else {
         return TC_ACT_OK;
     }
 
@@ -72,23 +75,28 @@ int tc_toa_injector(struct __sk_buff *skb) {
     if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) return TC_ACT_OK;
     if (!(tcph->syn && !tcph->ack)) return TC_ACT_OK;
     
-    // 将所有需要的值保存到局部变量中
+    // --- CRITICAL FIX: 将所有未来需要的值，从指针复制到安全的局部变量 ---
     old_tcp_len = tcph->doff * 4;
-    old_tot_len = iph->tot_len;
     if (old_tcp_len < sizeof(*tcph)) return TC_ACT_OK;
-
-    // --- "Parse First" 阶段结束 ---
+    
+    old_tot_len = iph->tot_len;
+    source_ip = iph->saddr;
+    dest_ip = iph->daddr;
+    source_port = tcph->source;
+    // --- "Parse First" 阶段结束，所有需要的值都已在栈上 ---
 
     // --- 2. 修改数据包 ---
     if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 3. "Write Later" 阶段：只写入，并使用之前保存的可信变量 ---
+    // --- 3. "Write Later" 阶段：只写入，并只使用安全的局部变量 ---
+    
+    // 填充 TOA 结构体，所有值都来自局部变量
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;
-    toa.port = tcph->source; // tcph 指针虽然失效，但其内容在 adjust_room 前已验证，可用于填充 toa
-    toa.ip = iph->saddr;     // 同上
+    toa.port = source_port;
+    toa.ip = source_ip;
 
     // 修正 L3 (IP) 头部
     __be16 new_tot_len = bpf_htons(bpf_ntohs(old_tot_len) + TCPOLEN_TOA);
@@ -97,17 +105,16 @@ int tc_toa_injector(struct __sk_buff *skb) {
 
     // 修正 L4 (TCP) 头部
     __u8 new_doff_byte = ((old_tcp_len + TCPOLEN_TOA) / 4) << 4; 
-    // 使用之前保存的 ip_hdr_len，不再从失效的 iph 指针读取
     bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + 12, &new_doff_byte, sizeof(new_doff_byte), 0);
     
     // 写入 TOA 选项，并让内核重算 L4 校验和
     bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + old_tcp_len, &toa, TCPOLEN_TOA, BPF_F_RECOMPUTE_CSUM);
 
-    // 记录日志 (iph 和 tcph 指针已失效，但其内容已保存到 event 结构体)
+    // 记录日志，所有值都来自局部变量
     struct log_event event;
-    event.src_ip = iph->saddr;
-    event.dst_ip = iph->daddr;
-    event.src_port = tcph->source;
+    event.src_ip = source_ip;
+    event.dst_ip = dest_ip;
+    event.src_port = source_port;
     event.dst_port = old_tcp_len;
     bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
