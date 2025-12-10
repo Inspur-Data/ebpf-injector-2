@@ -5,18 +5,13 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <linux/in.h>
-#include <linux/pkt_cls.h>
 
 #include "common.h"
 
-// VLAN header definition
-struct vlan_hdr {
-    __be16 h_vlan_TCI;
-    __be16 h_vlan_encapsulated_proto;
-};
+// VLAN 协议号
+#define ETH_P_8021Q 0x8100
 
-// TOA option definition
+// TOA 选项定义
 #define TCPOPT_TOA 254
 #define TCPOLEN_TOA 8
 struct toa_opt {
@@ -26,108 +21,103 @@ struct toa_opt {
     __be32 ip;
 };
 
-// eBPF map definitions
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65535);
-    __type(key, __u16);
-    __type(value, __u8);
-} ports_map SEC(".maps");
+// eBPF Maps
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65535); __type(key, __u16); __type(value, __u8); } ports_map SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); __uint(key_size, sizeof(int)); __uint(value_size, sizeof(int)); } log_events SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(int));
-    __uint(value_size, sizeof(int));
-} log_events SEC(".maps");
-
-
-SEC("tc")
-int tc_toa_injector(struct __sk_buff *skb) {
-    void *data_end = (void *)(long)skb->data_end;
-    void *data = (void *)(long)skb->data;
+// 使用 SEC("xdp") 定义一个 XDP 程序
+SEC("xdp")
+int xdp_toa_injector(struct xdp_md *ctx) {
+    // "先解析" - Part 1: 获取数据包指针
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
     struct ethhdr *eth = data;
     struct iphdr *iph;
     struct tcphdr *tcph;
     
-    __u32 ip_offset, ip_hdr_len;
+    // "先解析" - Part 2: 定义所有需要从包中读取的变量
+    __u32 ip_offset, ip_hdr_len, tcp_hdr_len;
+    __u16 h_proto, target_port;
     __be32 source_ip, dest_ip;
     __be16 source_port;
-    __u16 h_proto, target_port;
 
-    if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
+    // --- 开始解析 ---
+    ip_offset = sizeof(*eth);
+    if (data + ip_offset > data_end) return XDP_PASS;
 
     h_proto = eth->h_proto;
-    ip_offset = sizeof(*eth);
-
     if (h_proto == bpf_htons(ETH_P_8021Q)) {
-        struct vlan_hdr *vlan = (void *)eth + sizeof(*eth);
-        if ((void *)vlan + sizeof(*vlan) > data_end) return TC_ACT_OK;
-        h_proto = vlan->h_vlan_encapsulated_proto;
-        ip_offset += sizeof(*vlan);
+        ip_offset += 4;
+        if (data + ip_offset > data_end) return XDP_PASS;
+        // 假设只有一个VLAN tag, 重新读取内部的协议号
+        struct ethhdr *inner_eth = data + 4;
+        h_proto = inner_eth->h_proto;
     }
 
-    if (h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
-
-    iph = (struct iphdr *)(data + ip_offset);
-    if ((void *)iph + sizeof(*iph) > data_end) return TC_ACT_OK;
-
-    if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
+    if (h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
+    
+    iph = data + ip_offset;
+    if ((void *)iph + sizeof(*iph) > data_end) return XDP_PASS;
+    if (iph->protocol != IPPROTO_TCP) return XDP_PASS;
 
     ip_hdr_len = iph->ihl * 4;
-    if (ip_hdr_len < sizeof(*iph)) return TC_ACT_OK;
+    if (ip_hdr_len < sizeof(*iph)) return XDP_PASS; // 保证 ip_hdr_len 至少为 20
 
-    tcph = (struct tcphdr *)((void *)iph + ip_hdr_len);
-    if ((void *)tcph + sizeof(*tcph) > data_end) return TC_ACT_OK;
-    
+    tcph = (void *)iph + ip_hdr_len;
+    if ((void *)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
+
     target_port = bpf_ntohs(tcph->dest);
-    if (!bpf_map_lookup_elem(&ports_map, &target_port)) return TC_ACT_OK;
+    if (!bpf_map_lookup_elem(&ports_map, &target_port)) return XDP_PASS;
     
-    if (!(tcph->syn && !tcph->ack)) return TC_ACT_OK;
-    
-    __u32 tcp_hdr_len = tcph->doff * 4;
-    // --- "覆盖"模式的核心检查：TCP头必须足够长，我们才有空间可以覆盖 ---
-    if (tcp_hdr_len < 32) {
-        // 如果TCP头小于32字节 (比如标准的20或24字节)，它就没有足够的选项空间给我们去覆盖。
-        // 为了绝对安全，我们选择放弃修改，直接放行。
-        return TC_ACT_OK;
-    }
+    if (!(tcph->syn && !tcph->ack)) return XDP_PASS;
 
+    tcp_hdr_len = tcph->doff * 4;
+    if (tcp_hdr_len < 32) return XDP_PASS; // "覆盖"模式的安全检查
+
+    // "先解析" - Part 3: 将所有需要的值存入局部变量
     source_ip = iph->saddr;
     dest_ip = iph->daddr;
     source_port = tcph->source;
+    // --- "先解析" 阶段完全结束 ---
 
-    // --- "覆盖"模式的核心逻辑 ---
-    // 1. 计算要覆盖的起始位置。我们选择TCP头部的第24个字节开始。
-    //    这个位置通常是SACK或Timestamp选项，覆盖它们相对安全。
-    __u32 toa_offset = ip_offset + ip_hdr_len + 24;
+
+    // --- "后写入" 阶段 ---
     
-    // 2. 再次确认写入操作不会越过数据包的末尾 (这是一个安全的好习惯)
-    if ((void *)(long)(toa_offset + TCPOLEN_TOA) > data_end) {
-        return TC_ACT_OK;
-    }
-
-    // 3. 准备TOA数据
+    // 1. 准备 TOA 数据
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;
     toa.port = source_port;
     toa.ip = source_ip;
 
-    // 4. 核心操作：暴力覆盖！并让内核为我们重算校验和。
-    //    这个单一的操作，替代了之前所有复杂的、有风险的长度和校验和修改。
-    if (bpf_skb_store_bytes(skb, toa_offset, &toa, sizeof(toa), BPF_F_RECOMPUTE_CSUM) < 0) {
-        return TC_ACT_SHOT; // 如果写入失败，则丢弃该包
-    }
+    // 2. 计算覆盖位置 (使用已存入局部变量的值)
+    __u32 toa_offset = ip_offset + ip_hdr_len + 24;
 
-    // --- 记录日志 ---
-    struct log_event event;
-    event.src_ip = source_ip;
-    event.dst_ip = dest_ip;
-    event.src_port = source_port;
-    event.dst_port = tcp_hdr_len; // 仍然记录原始长度，用于调试
-    bpf_perf_event_output(skb, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    // 3. 边界检查
+    if (data + toa_offset + sizeof(toa) > data_end) return XDP_PASS;
+    
+    // 4. 核心修改：在XDP中，任何修改都需要先确保数据区是线性的。
+    //    bpf_xdp_adjust_head 是一个可以用来达成此目的的技巧。
+    if (bpf_xdp_adjust_head(ctx, 0 - (int)toa_offset)) return XDP_DROP;
+    if (bpf_xdp_adjust_head(ctx, (int)toa_offset)) return XDP_DROP;
 
-    return TC_ACT_OK;
+    // 5. 重新获取指针，因为 adjust_head 可能改变了它们
+    data     = (void *)(long)ctx->data;
+    data_end = (void *)(long)ctx->data_end;
+
+    // 6. 再次进行边界检查
+    if (data + toa_offset + sizeof(toa) > data_end) return XDP_DROP;
+
+    // 7. 执行覆盖
+    __builtin_memcpy(data + toa_offset, &toa, sizeof(toa));
+
+    // 8. 依赖网卡驱动的 Checksum Offload 功能来修复校验和。
+
+    // 9. 记录日志
+    struct log_event event = {source_ip, dest_ip, source_port, tcp_hdr_len};
+    bpf_perf_event_output(ctx, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+
+    return XDP_PASS; // 放行我们修改过的、但被伪装成“原始”数据包的 skb
 }
 
 char _license[] SEC("license") = "GPL";
