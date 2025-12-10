@@ -5,7 +5,7 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <linux/in.h>  // <--- 修复：添加此头文件以定义 IPPROTO_TCP
+#include <linux/in.h>
 
 #include "common.h"
 
@@ -65,8 +65,6 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     tcp_hdr_len = tcph->doff * 4;
     if (tcp_hdr_len < 32) return XDP_PASS;
 
-    // --- XDP 模式下的“覆盖”修改 ---
-    
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;

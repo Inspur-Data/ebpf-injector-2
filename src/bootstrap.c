@@ -7,7 +7,8 @@
 #include <errno.h>
 #include <sys/resource.h>
 #include <net/if.h>
-#include <linux/if_link.h> // <--- 修复：添加此头文件以定义 XDP_FLAGS
+#include <linux/if_link.h>
+#include <arpa/inet.h>  // <--- 修复：加回此头文件，解决 INET_ADDRSTRLEN 等错误
 #include <bpf/libbpf.h>
 #include "bootstrap.skel.h"
 #include "common.h"
@@ -27,9 +28,40 @@ void cleanup_xdp() {
     }
 }
 
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) { if (level > LIBBPF_WARN) return 0; return vfprintf(stderr, format, args); }
-void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { const struct log_event *e = data; char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &e->src_ip, src, sizeof(src)); inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst)); fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Original TCP Hdr Len: %u)\n", src, ntohs(e->src_port), dst, e->dst_port); }
-void parse_and_update_ports(struct bpf_map *map, char *ports_str) { if (!map) return; char *ports_copy = strdup(ports_str); if (!ports_copy) { perror("strdup"); return; } char *p = strtok(ports_copy, ","); while (p) { int start = atoi(p), end = start; char *dash = strchr(p, '-'); if (dash) end = atoi(dash + 1); if (start > 0 && end >= start && start <= 65535 && end <= 65535) { for (int port = start; port <= end; port++) { __u16 k = port; __u8 v = 1; bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY); } fprintf(stderr, "INFO: Enabled ports range: %d-%d\n", start, end); } p = strtok(NULL, ","); } free(ports_copy); }
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) { 
+    if (level > LIBBPF_WARN) return 0; 
+    return vfprintf(stderr, format, args); 
+}
+
+void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { 
+    const struct log_event *e = data; 
+    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN]; 
+    inet_ntop(AF_INET, &e->src_ip, src, sizeof(src)); 
+    inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst)); 
+    fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Original TCP Hdr Len: %u)\n", 
+           src, ntohs(e->src_port), dst, e->dst_port); 
+}
+
+void parse_and_update_ports(struct bpf_map *map, char *ports_str) { 
+    if (!map) return; 
+    char *ports_copy = strdup(ports_str); 
+    if (!ports_copy) { perror("strdup"); return; } 
+    char *p = strtok(ports_copy, ","); 
+    while (p) { 
+        int start = atoi(p), end = start; 
+        char *dash = strchr(p, '-'); 
+        if (dash) end = atoi(dash + 1); 
+        if (start > 0 && end >= start && start <= 65535 && end <= 65535) { 
+            for (int port = start; port <= end; port++) { 
+                __u16 k = port; __u8 v = 1; 
+                bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY); 
+            } 
+            fprintf(stderr, "INFO: Enabled ports range: %d-%d\n", start, end); 
+        } 
+        p = strtok(NULL, ","); 
+    } 
+    free(ports_copy); 
+}
 
 int main(int argc, char **argv) {
     struct bootstrap_bpf *skel;
