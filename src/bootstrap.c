@@ -53,10 +53,16 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
         if (dash) end = atoi(dash + 1); 
         if (start > 0 && end >= start && start <= 65535 && end <= 65535) { 
             for (int port = start; port <= end; port++) { 
-                __u16 k = port; __u8 v = 1; 
-                bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY); 
+                __u8 v = 1;
+                // 1. 写入主机字节序 Key
+                __u16 k_host = port; 
+                bpf_map__update_elem(map, &k_host, sizeof(k_host), &v, sizeof(v), BPF_ANY);
+                
+                // 2. 写入网络字节序 Key (大端)
+                __u16 k_net = htons(port);
+                bpf_map__update_elem(map, &k_net, sizeof(k_net), &v, sizeof(v), BPF_ANY);
             } 
-            fprintf(stderr, "INFO: Enabled ports range: %d-%d\n", start, end); 
+            fprintf(stderr, "INFO: Enabled ports range: %d-%d (Both Endians)\n", start, end); 
         } 
         p = strtok(NULL, ","); 
     } 
@@ -83,12 +89,11 @@ int main(int argc, char **argv) {
     skel = bootstrap_bpf__open();
     if (!skel) { fprintf(stderr, "ERROR: Failed to open BPF skeleton\n"); return 1; }
 
-    // --- 修复：重新加回 map flags 清零逻辑，防止潜在的兼容性问题 ---
+    // 重新加回 map flags 清零逻辑
     struct bpf_map *map;
     bpf_object__for_each_map(map, skel->obj) {
         bpf_map__set_map_flags(map, 0);
     }
-    // -----------------------------------------------------------
 
     if (bootstrap_bpf__load(skel)) { fprintf(stderr, "ERROR: Failed to load BPF skeleton\n"); goto cleanup; }
 

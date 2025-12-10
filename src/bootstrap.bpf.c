@@ -23,7 +23,6 @@ struct toa_opt {
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65535); __type(key, __u16); __type(value, __u8); } ports_map SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); __uint(key_size, sizeof(int)); __uint(value_size, sizeof(int)); } log_events SEC(".maps");
 
-// 校验和折叠辅助函数
 static __always_inline __u16 csum_fold_helper(__u64 csum) {
     int i;
     for (i = 0; i < 4; i++) {
@@ -33,13 +32,8 @@ static __always_inline __u16 csum_fold_helper(__u64 csum) {
     return ~csum;
 }
 
-// 增量更新 TCP 校验和
 static __always_inline void update_tcp_csum(struct tcphdr *tcph, void *old_data, void *new_data, int len) {
-    // 1. 计算数据的差异 (diff)
-    // seed (种子) 使用当前校验和的反码
     __u64 csum = bpf_csum_diff(old_data, len, new_data, len, ~tcph->check);
-    
-    // 2. 折叠并更新回校验和字段
     tcph->check = csum_fold_helper(csum);
 }
 
@@ -56,7 +50,6 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     __be32 source_ip, dest_ip;
     __be16 source_port;
 
-    // --- 解析层 ---
     ip_offset = sizeof(*eth);
     if (data + ip_offset > data_end) return XDP_PASS;
 
@@ -80,56 +73,44 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     tcph = (void *)iph + ip_hdr_len;
     if ((void *)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
 
-    // 端口检查
-    __u16 target_port_host = bpf_ntohs(tcph->dest);
-    if (!bpf_map_lookup_elem(&ports_map, &target_port_host)) return XDP_PASS;
+    // --- 端口检查：直接用原始值查询，无需转换 ---
+    // 因为 Map 中已存有双字节序的 Key，这能确保 100% 命中
+    if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) return XDP_PASS;
     
     if (!(tcph->syn && !tcph->ack)) return XDP_PASS;
 
     tcp_hdr_len = tcph->doff * 4;
-    if (tcp_hdr_len < 32) return XDP_PASS; // 确保有空间覆盖
+    if (tcp_hdr_len < 32) return XDP_PASS;
 
-    // --- 保存原始信息用于日志 ---
     source_ip = iph->saddr;
     dest_ip = iph->daddr;
     source_port = tcph->source;
 
-    // --- 准备 TOA 数据 ---
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;
     toa.port = source_port;
     toa.ip = source_ip;
 
-    toa_offset = ip_offset + ip_hdr_len + 24; // 覆盖偏移量
+    toa_offset = ip_offset + ip_hdr_len + 24; 
     
-    // --- 调整 Head 以便写入 ---
     if (bpf_xdp_adjust_head(ctx, 0 - (int)toa_offset)) return XDP_DROP;
     if (bpf_xdp_adjust_head(ctx, (int)toa_offset)) return XDP_DROP;
     
     data     = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     
-    // 重新边界检查
     if (data + toa_offset + sizeof(toa) > data_end) return XDP_DROP;
     if (data + ip_offset + ip_hdr_len + sizeof(struct tcphdr) > data_end) return XDP_DROP;
 
-    // --- 关键步骤 1: 读取旧数据 ---
-    // 我们必须知道我们要覆盖掉什么，才能计算校验和的差值
     __u8 old_data[8];
     __builtin_memcpy(old_data, data + toa_offset, 8);
 
-    // --- 关键步骤 2: 写入新数据 ---
     __builtin_memcpy(data + toa_offset, &toa, sizeof(toa));
 
-    // --- 关键步骤 3: 重新计算校验和 ---
-    // 重新获取 TCP 头指针 (data可能变了)
     tcph = (void *)data + ip_offset + ip_hdr_len;
-    
-    // 调用增量更新函数
     update_tcp_csum(tcph, old_data, &toa, 8);
 
-    // --- 日志 ---
     struct log_event event = {
         .src_ip = source_ip,
         .dst_ip = dest_ip,
