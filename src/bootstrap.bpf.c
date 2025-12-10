@@ -12,6 +12,7 @@
 #define ETH_P_8021Q 0x8100
 #define TCPOPT_TOA 254
 #define TCPOLEN_TOA 8
+#define TCPOPT_NOP 1 
 
 struct toa_opt {
     __u8   kind;
@@ -35,17 +36,6 @@ static __always_inline __u16 csum_fold_helper(__u64 csum) {
 static __always_inline void update_tcp_csum(struct tcphdr *tcph, void *old_data, void *new_data, int len) {
     __u64 csum = bpf_csum_diff(old_data, len, new_data, len, ~tcph->check);
     tcph->check = csum_fold_helper(csum);
-}
-
-// 调试事件发送函数
-static __always_inline void send_debug_event(struct xdp_md *ctx, __u32 err_code, __u16 port, __u32 len) {
-    struct log_event event;
-    __builtin_memset(&event, 0, sizeof(event));
-    event.src_ip = 0xFFFFFFFF; // 调试标记
-    event.dst_ip = err_code;   // 错误码
-    event.src_port = port;     // 看到的端口
-    event.dst_port = (__u16)len; // 看到的长度
-    bpf_perf_event_output(ctx, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 }
 
 SEC("xdp")
@@ -72,11 +62,11 @@ int xdp_toa_injector(struct xdp_md *ctx) {
         h_proto = inner_eth->h_proto;
     }
 
-    if (h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS; // Reason 1: Not IP (Silent)
+    if (h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
     
     iph = data + ip_offset;
     if ((void *)iph + sizeof(*iph) > data_end) return XDP_PASS;
-    if (iph->protocol != IPPROTO_TCP) return XDP_PASS; // Reason 2: Not TCP (Silent)
+    if (iph->protocol != IPPROTO_TCP) return XDP_PASS;
 
     ip_hdr_len = iph->ihl * 4;
     if (ip_hdr_len < sizeof(*iph)) return XDP_PASS;
@@ -84,34 +74,58 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     tcph = (void *)iph + ip_hdr_len;
     if ((void *)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
 
-    // --- 调试点 3: 端口匹配 ---
-    // 直接用原始值匹配，不做转换
-    if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) {
-        // 如果我们觉得可能是目标流量但被漏掉了，可以取消下面这行的注释来调试
-        // send_debug_event(ctx, 3, tcph->dest, 0);
-        return XDP_PASS;
-    }
+    // 端口匹配
+    if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) return XDP_PASS;
     
-    // --- 调试点 4: SYN 检查 ---
-    if (!(tcph->syn && !tcph->ack)) {
-        // 端口匹配了，但不是 SYN 包，说明是连接的其他部分，正常放行，不打印
-        return XDP_PASS; 
-    }
+    if (!(tcph->syn && !tcph->ack)) return XDP_PASS;
 
-    // --- 调试点 5: 头部长度检查 ---
     tcp_hdr_len = tcph->doff * 4;
-    if (tcp_hdr_len < 32) {
-        // 这是最可能的失败原因！打印出来！
-        send_debug_event(ctx, 5, tcph->dest, tcp_hdr_len);
-        return XDP_PASS;
-    }
+    // 确保有足够空间容纳标准选项 (MSS 4 + SACK 2 + TS 10 = 16字节选项 + 20字节头 = 36)
+    if (tcp_hdr_len < 36) return XDP_PASS;
 
-    // --- 开始注入 (如果能走到这里，说明一切正常) ---
     source_ip = iph->saddr;
     dest_ip = iph->daddr;
     source_port = tcph->source;
 
-    // 先打印个成功日志，证明匹配到了
+    // --- 构造替换块 (10 字节) ---
+    // [TOA (8 bytes)] + [NOP (1 byte)] + [NOP (1 byte)]
+    // 这将完美替换掉 Timestamp 选项 (10 bytes)
+    __u8 new_block[10];
+    
+    // 1. 填入 TOA
+    struct toa_opt *toa = (struct toa_opt *)new_block;
+    toa->kind = TCPOPT_TOA;
+    toa->len = TCPOLEN_TOA;
+    toa->port = source_port;
+    toa->ip = source_ip;
+    
+    // 2. 填入 NOP 填充尾部
+    new_block[8] = TCPOPT_NOP;
+    new_block[9] = TCPOPT_NOP;
+
+    // --- 修改点：计算偏移量 ---
+    // 从 24 改为 26，跳过 MSS(4) 和 SACK(2)
+    toa_offset = ip_offset + ip_hdr_len + 26; 
+    
+    // --- 边界检查 ---
+    if (data + toa_offset + 10 > data_end) return XDP_PASS;
+
+    // --- 读取旧数据 (10字节) ---
+    __u8 old_data[10];
+    __builtin_memcpy(old_data, data + toa_offset, 10);
+
+    // --- 写入新数据 ---
+    // 我们的操作不改变包长度，且在 XDP 线性区，直接写入
+    if (data + toa_offset + 10 <= data_end) {
+        __builtin_memcpy(data + toa_offset, new_block, 10);
+        
+        // --- 重新计算校验和 ---
+        tcph = (void *)data + ip_offset + ip_hdr_len;
+        if ((void*)tcph + sizeof(*tcph) <= data_end) {
+             update_tcp_csum(tcph, old_data, new_block, 10);
+        }
+    }
+
     struct log_event event = {
         .src_ip = source_ip,
         .dst_ip = dest_ip,
@@ -120,33 +134,7 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     };
     bpf_perf_event_output(ctx, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
-    struct toa_opt toa;
-    toa.kind = TCPOPT_TOA;
-    toa.len = TCPOLEN_TOA;
-    toa.port = source_port;
-    toa.ip = source_ip;
-
-    toa_offset = ip_offset + ip_hdr_len + 24; 
-    
-    if (bpf_xdp_adjust_head(ctx, 0 - (int)toa_offset)) return XDP_DROP;
-    if (bpf_xdp_adjust_head(ctx, (int)toa_offset)) return XDP_DROP;
-    
-    data     = (void *)(long)ctx->data;
-    data_end = (void *)(long)ctx->data_end;
-    
-    if (data + toa_offset + sizeof(toa) > data_end) return XDP_DROP;
-    if (data + ip_offset + ip_hdr_len + sizeof(struct tcphdr) > data_end) return XDP_DROP;
-
-    __u8 old_data[8];
-    __builtin_memcpy(old_data, data + toa_offset, 8);
-
-    __builtin_memcpy(data + toa_offset, &toa, sizeof(toa));
-
-    tcph = (void *)data + ip_offset + ip_hdr_len;
-    update_tcp_csum(tcph, old_data, &toa, 8);
-
     return XDP_PASS; 
 }
 
 char _license[] SEC("license") = "GPL";
-
