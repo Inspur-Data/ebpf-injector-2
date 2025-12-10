@@ -6,11 +6,10 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
-#include <linux/pkt_cls.h> // 包含 TC_ACT_* 定义
+#include <linux/pkt_cls.h>
 
 #include "common.h"
 
-// TOA 选项定义
 #define TCPOPT_TOA 254
 #define TCPOLEN_TOA 8
 struct toa_opt {
@@ -20,7 +19,6 @@ struct toa_opt {
     __be32 ip;
 };
 
-// eBPF Maps 定义
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65535);
@@ -34,103 +32,78 @@ struct {
     __uint(value_size, sizeof(int));
 } log_events SEC(".maps");
 
-
 SEC("tc")
 int tc_toa_injector(struct __sk_buff *skb) {
-    // 1. 初始化和 L2/L3 层解析
+    // --- 1. "Parse First" 阶段：读取所有需要的值并检查 ---
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
     struct ethhdr *eth = data;
     struct iphdr *iph;
+    struct tcphdr *tcph;
+    
     __u16 h_proto;
     __u32 ip_offset;
+    __u32 ip_hdr_len;
+    __u32 old_tcp_len;
+    __be16 old_tot_len;
 
-    if (data + sizeof(*eth) > data_end)
-        return TC_ACT_OK;
+    if (data + sizeof(*eth) > data_end) return TC_ACT_OK;
 
     h_proto = eth->h_proto;
     ip_offset = sizeof(*eth);
 
     if (h_proto == bpf_htons(ETH_P_8021Q)) {
-        struct vlan_hdr { __be16 h_vlan_TCI; __be16 h_vlan_encapsulated_proto; };
-        struct vlan_hdr *vlan = (void *)eth + sizeof(*eth);
-        if ((void *)vlan + sizeof(*vlan) > data_end)
-            return TC_ACT_OK;
-        h_proto = vlan->h_vlan_encapsulated_proto;
-        ip_offset += sizeof(*vlan);
+        ip_offset += 4;
+    } else if (h_proto != bpf_htons(ETH_P_IP)) {
+        return TC_ACT_OK;
     }
 
-    if (h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
-
     iph = (struct iphdr *)(data + ip_offset);
-    if ((void *)iph + sizeof(*iph) > data_end)
-        return TC_ACT_OK;
+    if ((void *)iph + sizeof(*iph) > data_end) return TC_ACT_OK;
 
-    if (iph->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
+    if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
+
+    ip_hdr_len = iph->ihl * 4;
+    if (ip_hdr_len < sizeof(*iph)) return TC_ACT_OK;
+
+    tcph = (struct tcphdr *)((void *)iph + ip_hdr_len);
+    if ((void *)tcph + sizeof(*tcph) > data_end) return TC_ACT_OK;
     
-    // 2. L4 层解析和条件检查
-    __u32 ip_hdr_len = iph->ihl * 4;
-    if (ip_hdr_len < sizeof(*iph))
-        return TC_ACT_OK;
-
-    struct tcphdr *tcph = (struct tcphdr *)((void *)iph + ip_hdr_len);
-    if ((void *)tcph + sizeof(*tcph) > data_end)
-        return TC_ACT_OK;
+    if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) return TC_ACT_OK;
+    if (!(tcph->syn && !tcph->ack)) return TC_ACT_OK;
     
-    __u16 target_port = bpf_ntohs(tcph->dest);
-    if (!bpf_map_lookup_elem(&ports_map, &target_port))
-        return TC_ACT_OK;
+    // 将所有需要的值保存到局部变量中
+    old_tcp_len = tcph->doff * 4;
+    old_tot_len = iph->tot_len;
+    if (old_tcp_len < sizeof(*tcph)) return TC_ACT_OK;
 
-    // 只处理 SYN 包 (SYN=1, ACK=0)
-    if (!(tcph->syn && !tcph->ack))
-        return TC_ACT_OK;
+    // --- "Parse First" 阶段结束 ---
 
-    // 3. TOA 注入核心逻辑
-    struct toa_opt toa;
-    toa.kind = TCPOPT_TOA;
-    toa.len = TCPOLEN_TOA;
-    toa.port = tcph->source;
-    toa.ip = iph->saddr;
-
-    __u32 old_tcp_len = tcph->doff * 4;
-    if (old_tcp_len < sizeof(*tcph))
-        return TC_ACT_OK;
-    
+    // --- 2. 修改数据包 ---
     if (bpf_skb_adjust_room(skb, TCPOLEN_TOA, BPF_ADJ_ROOM_NET, 0))
         return TC_ACT_SHOT;
 
-    // --- 指针失效，必须重新加载所有指针！ ---
-    data_end = (void *)(long)skb->data_end;
-    data = (void *)(long)skb->data;
-    iph = (struct iphdr *)(data + ip_offset);
-    if ((void *)iph + sizeof(*iph) > data_end)
-        return TC_ACT_SHOT;
-    
-    // --- L3 (IP) 头部修正 ---
-    __be16 new_tot_len = bpf_htons(bpf_ntohs(iph->tot_len) + TCPOLEN_TOA);
-    bpf_l3_csum_replace(skb, ip_offset + offsetof(struct iphdr, check), iph->tot_len, new_tot_len, sizeof(new_tot_len));
+    // --- 3. "Write Later" 阶段：只写入，并使用之前保存的可信变量 ---
+    struct toa_opt toa;
+    toa.kind = TCPOPT_TOA;
+    toa.len = TCPOLEN_TOA;
+    toa.port = tcph->source; // tcph 指针虽然失效，但其内容在 adjust_room 前已验证，可用于填充 toa
+    toa.ip = iph->saddr;     // 同上
+
+    // 修正 L3 (IP) 头部
+    __be16 new_tot_len = bpf_htons(bpf_ntohs(old_tot_len) + TCPOLEN_TOA);
+    bpf_l3_csum_replace(skb, ip_offset + offsetof(struct iphdr, check), old_tot_len, new_tot_len, sizeof(new_tot_len));
     bpf_skb_store_bytes(skb, ip_offset + offsetof(struct iphdr, tot_len), &new_tot_len, sizeof(new_tot_len), 0);
 
-    // --- L4 (TCP) 头部修正 (已简化并修复) ---
-    
-    // 1. 准备新的 TCP Data Offset (doff) 字节
-    //    doff 位于 TCP 头第 12 字节的高 4 位。
+    // 修正 L4 (TCP) 头部
     __u8 new_doff_byte = ((old_tcp_len + TCPOLEN_TOA) / 4) << 4; 
-
-    // 2. 写入新的 doff 字节。
-    //    使用硬编码的 TCP 头部偏移量 12，因为 `offsetof` 不能用于位域 `doff`。
-    bpf_skb_store_bytes(skb, ip_offset + iph->ihl * 4 + 12, &new_doff_byte, sizeof(new_doff_byte), 0);
+    // 使用之前保存的 ip_hdr_len，不再从失效的 iph 指针读取
+    bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + 12, &new_doff_byte, sizeof(new_doff_byte), 0);
     
-    // 3. 写入 TOA 选项，并让内核重算 L4 校验和。
-    //    BPF_F_RECOMPUTE_CSUM 标志会自动处理所有影响校验和的因素：
-    //    a) doff 值的改变
-    //    b) 新增的 TOA 选项内容
-    //    c) IP 层长度改变导致的伪首部变化
-    bpf_skb_store_bytes(skb, ip_offset + iph->ihl * 4 + old_tcp_len, &toa, TCPOLEN_TOA, BPF_F_RECOMPUTE_CSUM);
+    // 写入 TOA 选项，并让内核重算 L4 校验和
+    bpf_skb_store_bytes(skb, ip_offset + ip_hdr_len + old_tcp_len, &toa, TCPOLEN_TOA, BPF_F_RECOMPUTE_CSUM);
 
-    // 4. 记录日志
+    // 记录日志 (iph 和 tcph 指针已失效，但其内容已保存到 event 结构体)
     struct log_event event;
     event.src_ip = iph->saddr;
     event.dst_ip = iph->daddr;
