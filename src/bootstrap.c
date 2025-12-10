@@ -7,29 +7,26 @@
 #include <errno.h>
 #include <sys/resource.h>
 #include <net/if.h>
+#include <linux/if_link.h> // <--- 修复：添加此头文件以定义 XDP_FLAGS
 #include <bpf/libbpf.h>
 #include "bootstrap.skel.h"
 #include "common.h"
 
 static volatile bool exiting = false;
 static int ifindex = -1;
-// 明确指定使用 SKB_MODE，并让 libbpf 自动处理旧程序的替换
 static __u32 xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE;
 
 static void sig_handler(int sig) {
     exiting = true;
 }
 
-// XDP 清理函数
 void cleanup_xdp() {
     if (ifindex > 0) {
-        // 分离时，也需要指定 flags，但只需要 mode flag
-        bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, 0);
+        bpf_xdp_detach(ifindex, xdp_flags, 0);
         printf("\nDetached XDP program from interface %d.\n", ifindex);
     }
 }
 
-// ... (handle_event, parse_and_update_ports, libbpf_print_fn 不变) ...
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) { if (level > LIBBPF_WARN) return 0; return vfprintf(stderr, format, args); }
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { const struct log_event *e = data; char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &e->src_ip, src, sizeof(src)); inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst)); fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Original TCP Hdr Len: %u)\n", src, ntohs(e->src_port), dst, e->dst_port); }
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) { if (!map) return; char *ports_copy = strdup(ports_str); if (!ports_copy) { perror("strdup"); return; } char *p = strtok(ports_copy, ","); while (p) { int start = atoi(p), end = start; char *dash = strchr(p, '-'); if (dash) end = atoi(dash + 1); if (start > 0 && end >= start && start <= 65535 && end <= 65535) { for (int port = start; port <= end; port++) { __u16 k = port; __u8 v = 1; bpf_map__update_elem(map, &k, sizeof(k), &v, sizeof(v), BPF_ANY); } fprintf(stderr, "INFO: Enabled ports range: %d-%d\n", start, end); } p = strtok(NULL, ","); } free(ports_copy); }
@@ -58,7 +55,6 @@ int main(int argc, char **argv) {
 
     parse_and_update_ports(skel->maps.ports_map, argv[2]);
 
-    // 附加 XDP 程序
     err = bpf_xdp_attach(ifindex, bpf_program__fd(skel->progs.xdp_toa_injector), xdp_flags, NULL);
     if (err) {
         fprintf(stderr, "ERROR: Failed to attach XDP program: %s\n", strerror(-err));
