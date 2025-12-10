@@ -33,6 +33,9 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     
     __u32 ip_offset, ip_hdr_len, tcp_hdr_len, toa_offset;
     __u16 h_proto, target_port;
+    
+    __be32 source_ip, dest_ip;
+    __be16 source_port;
 
     ip_offset = sizeof(*eth);
     if (data + ip_offset > data_end) return XDP_PASS;
@@ -65,14 +68,20 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     tcp_hdr_len = tcph->doff * 4;
     if (tcp_hdr_len < 32) return XDP_PASS;
 
+    // --- 关键动作：保存数据到栈上，因为 iph/tcph 即将失效 ---
+    source_ip = iph->saddr;
+    dest_ip = iph->daddr;
+    source_port = tcph->source;
+
     struct toa_opt toa;
     toa.kind = TCPOPT_TOA;
     toa.len = TCPOLEN_TOA;
-    toa.port = tcph->source;
-    toa.ip = iph->saddr;
+    toa.port = source_port;
+    toa.ip = source_ip;
 
     toa_offset = ip_offset + ip_hdr_len + 24;
     
+    // adjust_head 技巧：使数据区线性化以便写入
     if (bpf_xdp_adjust_head(ctx, 0 - (int)toa_offset)) return XDP_DROP;
     if (bpf_xdp_adjust_head(ctx, (int)toa_offset)) return XDP_DROP;
     
@@ -83,7 +92,13 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     
     __builtin_memcpy(data + toa_offset, &toa, sizeof(toa));
 
-    struct log_event event = {iph->saddr, iph->daddr, tcph->source, tcp_hdr_len};
+    // 使用栈上保存的变量记录日志
+    struct log_event event = {
+        .src_ip = source_ip,
+        .dst_ip = dest_ip,
+        .src_port = source_port,
+        .dst_port = tcp_hdr_len
+    };
     bpf_perf_event_output(ctx, &log_events, BPF_F_CURRENT_CPU, &event, sizeof(event));
 
     return XDP_PASS; 

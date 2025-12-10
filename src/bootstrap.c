@@ -8,7 +8,7 @@
 #include <sys/resource.h>
 #include <net/if.h>
 #include <linux/if_link.h>
-#include <arpa/inet.h>  // <--- 修复：加回此头文件，解决 INET_ADDRSTRLEN 等错误
+#include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include "bootstrap.skel.h"
 #include "common.h"
@@ -82,6 +82,13 @@ int main(int argc, char **argv) {
     
     skel = bootstrap_bpf__open();
     if (!skel) { fprintf(stderr, "ERROR: Failed to open BPF skeleton\n"); return 1; }
+
+    // --- 修复：重新加回 map flags 清零逻辑，防止潜在的兼容性问题 ---
+    struct bpf_map *map;
+    bpf_object__for_each_map(map, skel->obj) {
+        bpf_map__set_map_flags(map, 0);
+    }
+    // -----------------------------------------------------------
 
     if (bootstrap_bpf__load(skel)) { fprintf(stderr, "ERROR: Failed to load BPF skeleton\n"); goto cleanup; }
 
