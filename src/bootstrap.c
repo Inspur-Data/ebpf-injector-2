@@ -33,19 +33,13 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     return vfprintf(stderr, format, args); 
 }
 
-// --- 修改点：打印 TCP 选项的 Hex 数据 ---
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { 
     const struct log_event *e = data; 
     char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN]; 
     inet_ntop(AF_INET, &e->src_ip, src, sizeof(src)); 
     inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst)); 
-    
-    fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Len: %u)\n", 
-           src, ntohs(e->src_port), dst, e->dst_port);
-    
-    // 打印 12 字节的 Hex
-    fprintf(stdout, "      Raw Opts: %08x %08x %08x\n", 
-            ntohl(e->opts_w1), ntohl(e->opts_w2), ntohl(e->opts_w3));
+    fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Original TCP Hdr Len: %u)\n", 
+           src, ntohs(e->src_port), dst, e->dst_port); 
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) { 
