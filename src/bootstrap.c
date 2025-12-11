@@ -24,11 +24,9 @@ static void sig_handler(int sig) {
 
 void cleanup_all() {
     if (ifindex > 0) {
-        // 清理 XDP
         bpf_xdp_detach(ifindex, xdp_flags, 0);
         printf("Detached XDP.\n");
         
-        // 清理 TC
         if (tc_hook.ifindex > 0) {
             bpf_tc_hook_destroy(&tc_hook);
             printf("Destroyed TC hook.\n");
@@ -43,11 +41,6 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { 
     const struct log_event *e = data; 
-    
-    // 我们用 dst_port 来区分是哪个程序发的日志
-    // 11111 = Ingress XDP (Record)
-    // 22222 = Egress TC (Inject)
-    
     char src[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
 
@@ -61,7 +54,6 @@ void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) {
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) { 
-    // ... (保持之前的双字节序注册逻辑不变) ...
     if (!map) return; char *ports_copy = strdup(ports_str); if (!ports_copy) return; char *p = strtok(ports_copy, ","); while (p) { int start = atoi(p), end = start; char *dash = strchr(p, '-'); if (dash) end = atoi(dash + 1); if (start > 0) { for (int port = start; port <= end; port++) { __u8 v = 1; __u16 k_host = port; bpf_map__update_elem(map, &k_host, sizeof(k_host), &v, sizeof(v), BPF_ANY); __u16 k_net = htons(port); bpf_map__update_elem(map, &k_net, sizeof(k_net), &v, sizeof(v), BPF_ANY); } fprintf(stderr, "INFO: Enabled ports range: %d-%d\n", start, end); } p = strtok(NULL, ","); } free(ports_copy);
 }
 
@@ -101,11 +93,10 @@ int main(int argc, char **argv) {
     memset(&tc_hook, 0, sizeof(tc_hook));
     tc_hook.sz = sizeof(tc_hook);
     tc_hook.ifindex = ifindex;
-    tc_hook.attach_point = BPF_TC_EGRESS; // 关键！挂在出口
+    tc_hook.attach_point = BPF_TC_EGRESS;
 
     struct bpf_tc_opts tc_opts = {.sz = sizeof(tc_opts), .prog_fd = bpf_program__fd(skel->progs.tc_egress_inject)};
     
-    // 尝试清理旧的
     bpf_tc_hook_create(&tc_hook); // 忽略 EEXIST
     bpf_tc_detach(&tc_hook, &tc_opts);
 
