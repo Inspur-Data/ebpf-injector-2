@@ -33,22 +33,8 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     return vfprintf(stderr, format, args); 
 }
 
-// --- 修改后的事件处理，支持显示调试信息 ---
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { 
     const struct log_event *e = data; 
-    
-    // 如果 src_ip 是魔术数字，说明这是调试消息
-    if (e->src_ip == 0xFFFFFFFF) {
-        fprintf(stdout, "[DEBUG] Packet Skipped! Reason Code: %u | Port seen: %u | Header Len: %u\n", 
-                e->dst_ip, e->src_port, e->dst_port);
-        fprintf(stdout, "  -> Reason 1: Not IPv4\n"
-                        "  -> Reason 2: Not TCP\n"
-                        "  -> Reason 3: Port Mismatch (Check 'Port seen')\n"
-                        "  -> Reason 4: Not SYN packet\n"
-                        "  -> Reason 5: TCP Header too short (Check 'Header Len')\n");
-        return;
-    }
-
     char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN]; 
     inet_ntop(AF_INET, &e->src_ip, src, sizeof(src)); 
     inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst)); 
@@ -68,7 +54,6 @@ void parse_and_update_ports(struct bpf_map *map, char *ports_str) {
         if (start > 0 && end >= start && start <= 65535 && end <= 65535) { 
             for (int port = start; port <= end; port++) { 
                 __u8 v = 1;
-                // 同时写入主机序和网络序，确保覆盖所有情况
                 __u16 k_host = port; 
                 bpf_map__update_elem(map, &k_host, sizeof(k_host), &v, sizeof(v), BPF_ANY);
                 __u16 k_net = htons(port);
