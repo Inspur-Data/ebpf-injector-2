@@ -16,7 +16,6 @@
 #define TCPOPT_TOA 254
 #define TCPOLEN_TOA 8
 
-// 简化调试宏，防止参数过多
 #define bpf_debug(fmt, val) ({ char _fmt[] = fmt; bpf_trace_printk(_fmt, sizeof(_fmt), val); })
 #define bpf_debug2(fmt, v1, v2) ({ char _fmt[] = fmt; bpf_trace_printk(_fmt, sizeof(_fmt), v1, v2); })
 
@@ -29,7 +28,7 @@ struct toa_replace_block {
     __u8   nop2;
 } __attribute__((packed));
 
-struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1); __type(key, __u16); __type(value, __u8); } ports_map SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65535); __type(key, __u16); __type(value, __u8); } ports_map SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY); __uint(key_size, sizeof(int)); __uint(value_size, sizeof(int)); } log_events SEC(".maps");
 
 static __always_inline __u16 csum_fold_helper(__u64 csum) {
@@ -47,7 +46,6 @@ static __always_inline void update_tcp_csum(struct tcphdr *tcph, void *old_data,
     bpf_debug("New Csum: 0x%x\n", bpf_ntohs(tcph->check));
 }
 
-// 辅助函数：分段打印 12 字节
 static __always_inline void print_hex_dump(void *data, void *data_end) {
     if (data + 12 <= data_end) {
         __u32 *w = data;
@@ -58,12 +56,11 @@ static __always_inline void print_hex_dump(void *data, void *data_end) {
 }
 
 SEC("xdp")
-int xdp_ct_scan(struct xdp_md *ctx) {
+int xdp_toa_injector(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data     = (void *)(long)ctx->data;
     struct ethhdr *eth = data;
     
-    // 1. 基础解析
     if (data + sizeof(*eth) > data_end) return XDP_PASS;
     __u32 ip_offset = sizeof(*eth);
     if (eth->h_proto == bpf_htons(ETH_P_8021Q)) ip_offset += 4;
@@ -77,12 +74,10 @@ int xdp_ct_scan(struct xdp_md *ctx) {
     struct tcphdr *tcph = (void*)iph + ip_hdr_len;
     if ((void*)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
 
-    // 2. 端口过滤
     __u16 dst_port = bpf_ntohs(tcph->dest);
-    if (!tcph->syn && !tcph->ack) return XDP_PASS; 
-    if (dst_port != 20020) return XDP_PASS; 
+    // 调试过滤器：只看目标端口 > 10000 的，或者 SYN 包
+    if (dst_port < 10000 && !tcph->syn) return XDP_PASS; 
 
-    // --- 开始扫描 ---
     bpf_debug("=== NEW PKT Port %d ===\n", dst_port);
     
     __u32 tcp_hdr_len = tcph->doff * 4;
@@ -91,14 +86,11 @@ int xdp_ct_scan(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    // 打印修改前
     void *opts_start = (void*)tcph + 20;
     print_hex_dump(opts_start, data_end);
 
-    // --- 简单粗暴定位法：假设 Timestamp 在 Offset 26 ---
-    // (因为循环太难写且易报错，我们先验证这个假设对不对)
-    // 偏移量：IP(20) + TCP(20) + 6 = 46
-    __u32 target_offset = ip_offset + 46;
+    // 假设 Timestamp 在偏移 26
+    __u32 target_offset = ip_offset + 20 + 26;
     void *target_ptr = data + target_offset;
     
     if (target_ptr + 2 > data_end) return XDP_PASS;
@@ -114,7 +106,6 @@ int xdp_ct_scan(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    // --- 执行替换 ---
     bpf_debug("Injecting at 26...\n", 0);
 
     struct toa_replace_block block;
@@ -131,13 +122,11 @@ int xdp_ct_scan(struct xdp_md *ctx) {
     __builtin_memcpy(old_data, target_ptr, 10);
     __builtin_memcpy(target_ptr, &block, sizeof(block));
     
-    // 更新校验和
     tcph = (void *)data + ip_offset + ip_hdr_len;
     if ((void*)tcph + sizeof(*tcph) <= data_end) {
          update_tcp_csum(tcph, old_data, &block, 10);
     }
 
-    // 打印修改后
     tcph = (void *)data + ip_offset + ip_hdr_len;
     opts_start = (void*)tcph + 20;
     print_hex_dump(opts_start, data_end);
