@@ -16,6 +16,7 @@
 #define TCPOPT_TOA 254
 #define TCPOLEN_TOA 8
 
+// 调试宏
 #define bpf_debug(fmt, val) ({ char _fmt[] = fmt; bpf_trace_printk(_fmt, sizeof(_fmt), val); })
 #define bpf_debug2(fmt, v1, v2) ({ char _fmt[] = fmt; bpf_trace_printk(_fmt, sizeof(_fmt), v1, v2); })
 
@@ -62,10 +63,12 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     struct ethhdr *eth = data;
     
+    // 1. 解析层
     if (data + sizeof(*eth) > data_end) return XDP_PASS;
     __u32 ip_offset = sizeof(*eth);
     if (eth->h_proto == bpf_htons(ETH_P_8021Q)) ip_offset += 4;
     
+    // 简单检查 IP
     if (eth->h_proto != bpf_htons(ETH_P_IP) && eth->h_proto != bpf_htons(ETH_P_8021Q)) return XDP_PASS;
 
     struct iphdr *iph = data + ip_offset;
@@ -77,53 +80,44 @@ int xdp_toa_injector(struct xdp_md *ctx) {
     if ((void*)tcph + sizeof(*tcph) > data_end) return XDP_PASS;
 
     __u16 dst_port = bpf_ntohs(tcph->dest);
-    // 调试过滤器：只看目标端口 > 10000 的，或者 SYN 包
-    if (dst_port < 10000 && !tcph->syn) return XDP_PASS; 
-
-    bpf_debug("=== NEW PKT Port %d ===\n", dst_port);
     
-    __u32 tcp_hdr_len = tcph->doff * 4;
-    if (tcp_hdr_len < 32) {
-        bpf_debug("Short header: %d\n", tcp_hdr_len);
-        return XDP_PASS;
+    // 2. 调试逻辑
+    if (dst_port == 20020) {
+        bpf_debug("=== HIT Port 20020 ===\n", 0);
+        
+        // Map 检查
+        if (!bpf_map_lookup_elem(&ports_map, &tcph->dest)) {
+            bpf_debug("Map: FAIL\n", 0);
+        } else {
+            bpf_debug("Map: OK\n", 0);
+        }
+
+        // SYN 检查
+        bpf_debug("SYN: %d\n", tcph->syn);
+
+        // 长度检查
+        __u32 tcp_len = tcph->doff * 4;
+        bpf_debug("Len: %d\n", tcp_len);
+
+        // --- Hex Dump (前12字节) ---
+        if (tcp_len > 20) {
+            __u8 *opts = (void*)tcph + 20;
+            if ((void*)opts + 12 <= data_end) {
+                __u32 w1 = *(__u32*)opts;
+                __u32 w2 = *(__u32*)(opts + 4);
+                __u32 w3 = *(__u32*)(opts + 8);
+                // 打印 3 个 32位字
+                bpf_debug("HEX 0-3: %08x\n", bpf_ntohl(w1));
+                bpf_debug("HEX 4-7: %08x\n", bpf_ntohl(w2));
+                bpf_debug("HEX 8-11: %08x\n", bpf_ntohl(w3));
+            } else {
+                bpf_debug("HEX: Too short to dump\n", 0);
+            }
+        } else {
+            bpf_debug("HEX: No options\n", 0);
+        }
     }
 
-    void *opts_start = (void*)tcph + 20;
-    print_hex_dump(opts_start, data_end);
-
-    // 假设 Timestamp 在偏移 26
-    __u32 target_offset = ip_offset + 20 + 26;
-    void *target_ptr = data + target_offset;
-    
-    if (target_ptr + 2 > data_end) return XDP_PASS;
-    
-    __u8 kind = *(__u8*)target_ptr;
-    __u8 len = *(__u8*)(target_ptr + 1);
-    
-    bpf_debug2("At Off 26: Kind=%d Len=%d\n", kind, len);
-
-    // 只有当这里真的是 Timestamp (Kind=8, Len=10) 时才替换
-    if (kind != TCPOPT_TIMESTAMP || len != 10) {
-        bpf_debug("TS not at 26! Abort.\n", 0);
-        return XDP_PASS;
-    }
-
-    bpf_debug("Injecting at 26...\n", 0);
-
-    struct toa_replace_block block;
-    block.kind = TCPOPT_TOA;
-    block.len = TCPOLEN_TOA;
-    block.port = tcph->source;
-    block.ip = iph->saddr;
-    block.nop1 = TCPOPT_NOP;
-    block.nop2 = TCPOPT_NOP;
-
-    if (target_ptr + 10 > data_end) return XDP_PASS;
-
-    __u8 old_data[10];
-    __builtin_memcpy(old_data, target_ptr, 10);
-    __builtin_memcpy(target_ptr, &block, sizeof(block));
-    
-    tcph = (void *)data + ip_offset + ip_hdr_len;
-    if ((void*)tcph + sizeof(*tcph) <= data_end) {
-         upda
+    return XDP_PASS;
+}
+char _license[] SEC("license") = "GPL";
