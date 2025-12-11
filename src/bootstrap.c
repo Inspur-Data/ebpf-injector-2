@@ -16,15 +16,23 @@
 static volatile bool exiting = false;
 static int ifindex = -1;
 static __u32 xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE;
+static struct bpf_tc_hook tc_hook;
 
 static void sig_handler(int sig) {
     exiting = true;
 }
 
-void cleanup_xdp() {
+void cleanup_all() {
     if (ifindex > 0) {
+        // 清理 XDP
         bpf_xdp_detach(ifindex, xdp_flags, 0);
-        printf("\nDetached XDP program from interface %d.\n", ifindex);
+        printf("Detached XDP.\n");
+        
+        // 清理 TC
+        if (tc_hook.ifindex > 0) {
+            bpf_tc_hook_destroy(&tc_hook);
+            printf("Destroyed TC hook.\n");
+        }
     }
 }
 
@@ -35,35 +43,26 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 
 void handle_event(void *ctx, int cpu, void *data, __u32 data_sz) { 
     const struct log_event *e = data; 
-    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN]; 
-    inet_ntop(AF_INET, &e->src_ip, src, sizeof(src)); 
-    inet_ntop(AF_INET, &e->dst_ip, dst, sizeof(dst)); 
-    fprintf(stdout, "[LOG] TOA Injected! Src: %s:%u -> Dst: %s (Original TCP Hdr Len: %u)\n", 
-           src, ntohs(e->src_port), dst, e->dst_port); 
+    
+    // 我们用 dst_port 来区分是哪个程序发的日志
+    // 11111 = Ingress XDP (Record)
+    // 22222 = Egress TC (Inject)
+    
+    char src[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &e->src_ip, src, sizeof(src));
+
+    if (e->dst_port == 11111) {
+        fprintf(stdout, "[INGRESS] Recorded: %s:%u\n", src, ntohs(e->src_port));
+    } else if (e->dst_port == 22222) {
+        fprintf(stdout, "[EGRESS ] Injected: %s:%u (Success!)\n", src, ntohs(e->src_port));
+    } else {
+        fprintf(stdout, "[UNKNOWN] Src: %s:%u\n", src, ntohs(e->src_port));
+    }
 }
 
 void parse_and_update_ports(struct bpf_map *map, char *ports_str) { 
-    if (!map) return; 
-    char *ports_copy = strdup(ports_str); 
-    if (!ports_copy) { perror("strdup"); return; } 
-    char *p = strtok(ports_copy, ","); 
-    while (p) { 
-        int start = atoi(p), end = start; 
-        char *dash = strchr(p, '-'); 
-        if (dash) end = atoi(dash + 1); 
-        if (start > 0 && end >= start && start <= 65535 && end <= 65535) { 
-            for (int port = start; port <= end; port++) { 
-                __u8 v = 1;
-                __u16 k_host = port; 
-                bpf_map__update_elem(map, &k_host, sizeof(k_host), &v, sizeof(v), BPF_ANY);
-                __u16 k_net = htons(port);
-                bpf_map__update_elem(map, &k_net, sizeof(k_net), &v, sizeof(v), BPF_ANY);
-            } 
-            fprintf(stderr, "INFO: Enabled ports range: %d-%d (Dual Endian)\n", start, end); 
-        } 
-        p = strtok(NULL, ","); 
-    } 
-    free(ports_copy); 
+    // ... (保持之前的双字节序注册逻辑不变) ...
+    if (!map) return; char *ports_copy = strdup(ports_str); if (!ports_copy) return; char *p = strtok(ports_copy, ","); while (p) { int start = atoi(p), end = start; char *dash = strchr(p, '-'); if (dash) end = atoi(dash + 1); if (start > 0) { for (int port = start; port <= end; port++) { __u8 v = 1; __u16 k_host = port; bpf_map__update_elem(map, &k_host, sizeof(k_host), &v, sizeof(v), BPF_ANY); __u16 k_net = htons(port); bpf_map__update_elem(map, &k_net, sizeof(k_net), &v, sizeof(v), BPF_ANY); } fprintf(stderr, "INFO: Enabled ports range: %d-%d\n", start, end); } p = strtok(NULL, ","); } free(ports_copy);
 }
 
 int main(int argc, char **argv) {
@@ -84,39 +83,50 @@ int main(int argc, char **argv) {
     signal(SIGTERM, sig_handler);
     
     skel = bootstrap_bpf__open();
-    if (!skel) { fprintf(stderr, "ERROR: Failed to open BPF skeleton\n"); return 1; }
+    if (!skel) { fprintf(stderr, "ERROR: Open BPF\n"); return 1; }
 
     struct bpf_map *map;
-    bpf_object__for_each_map(map, skel->obj) {
-        bpf_map__set_map_flags(map, 0);
-    }
+    bpf_object__for_each_map(map, skel->obj) { bpf_map__set_map_flags(map, 0); }
 
-    if (bootstrap_bpf__load(skel)) { fprintf(stderr, "ERROR: Failed to load BPF skeleton\n"); goto cleanup; }
+    if (bootstrap_bpf__load(skel)) { fprintf(stderr, "ERROR: Load BPF\n"); goto cleanup; }
 
     parse_and_update_ports(skel->maps.ports_map, argv[2]);
 
-    err = bpf_xdp_attach(ifindex, bpf_program__fd(skel->progs.xdp_toa_injector), xdp_flags, NULL);
-    if (err) {
-        fprintf(stderr, "ERROR: Failed to attach XDP program: %s\n", strerror(-err));
+    // 1. 挂载 XDP Ingress
+    err = bpf_xdp_attach(ifindex, bpf_program__fd(skel->progs.xdp_ingress_record), xdp_flags, NULL);
+    if (err) { fprintf(stderr, "ERROR: Attach XDP: %s\n", strerror(-err)); goto cleanup; }
+    printf("XDP Ingress attached.\n");
+
+    // 2. 挂载 TC Egress
+    memset(&tc_hook, 0, sizeof(tc_hook));
+    tc_hook.sz = sizeof(tc_hook);
+    tc_hook.ifindex = ifindex;
+    tc_hook.attach_point = BPF_TC_EGRESS; // 关键！挂在出口
+
+    struct bpf_tc_opts tc_opts = {.sz = sizeof(tc_opts), .prog_fd = bpf_program__fd(skel->progs.tc_egress_inject)};
+    
+    // 尝试清理旧的
+    bpf_tc_hook_create(&tc_hook); // 忽略 EEXIST
+    bpf_tc_detach(&tc_hook, &tc_opts);
+
+    if (bpf_tc_attach(&tc_hook, &tc_opts)) {
+        fprintf(stderr, "ERROR: Attach TC: %s\n", strerror(errno));
         goto cleanup;
     }
-    printf("Successfully attached XDP TOA injector to interface %s (ifindex %d).\n", argv[1], ifindex);
+    printf("TC Egress attached.\n");
 
     pb = perf_buffer__new(bpf_map__fd(skel->maps.log_events), 8, handle_event, NULL, NULL, NULL);
-    if (!pb) { err = -errno; fprintf(stderr, "ERROR: Failed to create perf buffer: %d\n", err); goto cleanup; }
+    if (!pb) { fprintf(stderr, "ERROR: Perf buffer\n"); goto cleanup; }
 
-    printf("Watching for events... Press Ctrl+C to exit.\n");
+    printf("Running... Press Ctrl+C to exit.\n");
     
     while (!exiting) {
         err = perf_buffer__poll(pb, 100);
-        if (err < 0 && err != -EINTR) {
-            fprintf(stderr, "ERROR: Polling perf buffer: %s\n", strerror(-err));
-            break;
-        }
+        if (err < 0 && err != -EINTR) break;
     }
 
 cleanup:
-    cleanup_xdp();
+    cleanup_all();
     if (pb) perf_buffer__free(pb);
     if (skel) bootstrap_bpf__destroy(skel);
     return -err;
